@@ -4,7 +4,7 @@ import uvicorn
 
 
 def main() -> None:
-    # Hugging Face Docker Spaces 默认监听 7860，也兼容平台注入的 PORT。
+    # 云平台会注入 PORT；本地直接运行时仍使用 7860。
     port = int(os.getenv("PORT", "7860"))
     uvicorn.run(
         "app.main:app",

@@ -1,6 +1,6 @@
-# Deploy ArtMentor with Hugging Face and Supabase
+# Deploy ArtMentor with Render and Supabase
 
-This production path keeps the public application in one Hugging Face Docker Space. FastAPI serves both the built React site and `/api`; Supabase provides durable PostgreSQL and private S3-compatible artwork storage.
+This production path keeps the public application in one Render Docker web service. FastAPI serves both the built React site and `/api`; Supabase provides durable PostgreSQL and private S3-compatible artwork storage.
 
 ## 1. Create the Supabase resources
 
@@ -11,19 +11,22 @@ This production path keeps the public application in one Hugging Face Docker Spa
 
 Do not commit any copied value. ArtMentor accepts Supabase's normal `postgresql://...` URL and switches it to the installed psycopg 3 driver internally.
 
-## 2. Create the Hugging Face Space
+## 2. Publish the repository
 
-Create a new Space with:
+Push this repository to a public GitHub repository. The root Dockerfile builds the React frontend, installs the FastAPI backend, then serves both from one process. Never commit `.env` or any value from the tables below.
 
-- SDK: **Docker**
-- Visibility: **Public**
-- Port: `7860` (declared by the README metadata and root Dockerfile)
+## 3. Create the Render Blueprint
 
-Push the repository contents to the Space repository. The root Dockerfile builds the React frontend, installs the FastAPI backend, then serves both from one process.
+1. Sign in to Render and choose **New → Blueprint**.
+2. Connect the public GitHub repository.
+3. Render detects `render.yaml`, creates a free Docker web service, and prompts for every entry marked `sync: false`.
+4. Keep the generated `SESSION_SECRET`; do not replace it with a value committed to source control.
 
-## 3. Configure Space secrets
+The Blueprint includes the health check, Supabase endpoint and region, free instance plan, upload limits, AI-call limits, and automatic deploys from the default branch.
 
-Add these under **Settings → Variables and secrets → Secrets**:
+## 4. Enter deployment secrets
+
+Enter these only in Render's Blueprint secret prompts:
 
 | Secret | Value |
 | --- | --- |
@@ -31,16 +34,9 @@ Add these under **Settings → Variables and secrets → Secrets**:
 | `S3_ACCESS_KEY` | Supabase Storage S3 access key ID |
 | `S3_SECRET_KEY` | Supabase Storage S3 secret access key |
 | `GPTSAPI_KEY` | WildAI / GPTsAPI key |
-| `SESSION_SECRET` | A new long random string, at least 32 characters |
 | `DEMO_ACCESS_CODE` | A code shared only with reviewers and testers |
 
-Generate `SESSION_SECRET` locally without putting it in chat or source control:
-
-```powershell
-python -c "import secrets; print(secrets.token_urlsafe(48))"
-```
-
-Add these as ordinary Space variables:
+The checked-in `render.yaml` supplies these non-secret variables:
 
 | Variable | Recommended value |
 | --- | --- |
@@ -49,32 +45,33 @@ Add these as ordinary Space variables:
 | `GPTSAPI_MODEL` | `gpt-5.6-terra` |
 | `ALLOW_DEMO_FALLBACK` | `false` |
 | `STORAGE_BACKEND` | `s3` |
-| `S3_ENDPOINT` | Supabase Storage S3 endpoint shown in the dashboard |
+| `S3_ENDPOINT` | Supabase Storage S3 endpoint |
 | `S3_BUCKET` | `artmentor-artworks` |
 | `S3_REGION` | Region shown in the Supabase S3 settings |
 | `S3_AUTO_CREATE_BUCKET` | `false` |
 | `SESSION_COOKIE_SECURE` | `true` |
 | `MAX_UPLOAD_MB` | `10` |
-| `AI_RATE_LIMIT_PER_HOUR` | `20` |
-| `UPLOAD_RATE_LIMIT_PER_HOUR` | `10` |
-| `MAX_CONCURRENT_AI_REQUESTS` | `2` |
+| `AI_RATE_LIMIT_PER_HOUR` | `12` |
+| `UPLOAD_RATE_LIMIT_PER_HOUR` | `8` |
+| `MAX_CONCURRENT_AI_REQUESTS` | `1` |
 
-The access code is optional in code, but strongly recommended because every successful critique spends a shared third-party API allowance.
+The access code is optional in code, but required by this Blueprint prompt and strongly recommended because every successful critique spends a shared third-party API allowance.
 
-## 4. Verify the deployed result
+## 5. Verify the deployed result
 
-After the Space reports **Running**:
+After Render reports **Live**:
 
 1. Open `/api/health` and confirm `status` is `ok`, `storage` is `s3`, and `ai_configured` is `true`.
 2. Open the root URL in a private browser window and confirm the access gate appears.
 3. Import one public-domain sample, run a critique, refresh the page, and confirm it remains in Recent work.
 4. Open a second private browser profile and confirm the first profile's project is not listed and its media URL returns 404.
-5. Upload a revision and confirm the before/after report survives a Space restart.
+5. Upload a revision and confirm the before/after report survives a Render restart.
 
 ## Privacy and operational limits
 
 - The anonymous HttpOnly cookie separates visitors without collecting an email or username.
 - Clearing that cookie makes the old history inaccessible to that browser; it does not delete the stored data. Account login and self-service deletion belong in the next version.
 - Uploaded images are private application objects, but they are sent to the configured vision provider when the user explicitly starts a critique.
-- Rate limits are in memory and reset when the Space restarts. The access code is the main cost-control boundary for this MVP.
-- Hugging Face's local filesystem is not used for production data, so Space sleep or rebuild does not remove Supabase records or images.
+- Rate limits are in memory and reset when the service restarts. The access code is the main cost-control boundary for this MVP.
+- Render's local filesystem is not used for production data, so sleep or rebuild does not remove Supabase records or images.
+- A free Render service sleeps after 15 minutes without inbound traffic. Its first request after sleep can take about a minute while the container starts.

@@ -1,0 +1,49 @@
+services:
+  - type: web
+    name: artmentor
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: AI_PROVIDER
+        value: gptsapi
+      - key: GPTSAPI_BASE_URL
+        value: https://api.gptsapi.net/v1
+      - key: GPTSAPI_MODEL
+        value: gpt-5.6-terra
+      - key: GPTSAPI_KEY
+        sync: false
+      - key: ALLOW_DEMO_FALLBACK
+        value: "false"
+      - key: DATABASE_URL
+        sync: false
+      - key: STORAGE_BACKEND
+        value: s3
+      - key: S3_ENDPOINT
+        value: https://xvmyxrwipzlqtljnkkhj.storage.supabase.co/storage/v1/s3
+      - key: S3_REGION
+        value: ap-northeast-1
+      - key: S3_BUCKET
+        value: artmentor-artworks
+      - key: S3_AUTO_CREATE_BUCKET
+        value: "false"
+      - key: S3_ACCESS_KEY
+        sync: false
+      - key: S3_SECRET_KEY
+        sync: false
+      - key: SESSION_SECRET
+        generateValue: true
+      - key: SESSION_COOKIE_SECURE
+        value: "true"
+      - key: DEMO_ACCESS_CODE
+        sync: false
+      - key: MAX_UPLOAD_MB
+        value: "10"
+      - key: AI_RATE_LIMIT_PER_HOUR
+        value: "12"
+      - key: UPLOAD_RATE_LIMIT_PER_HOUR
+        value: "8"
+      - key: MAX_CONCURRENT_AI_REQUESTS
+        value: "1"

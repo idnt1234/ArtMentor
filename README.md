@@ -1,15 +1,3 @@
----
-title: ArtMentor
-emoji: 🎨
-colorFrom: indigo
-colorTo: orange
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
-short_description: Intent-aware AI critique for digital illustration
----
-
 # ArtMentor
 
 ArtMentor is an intent-aware critique workspace for digital illustration. An artist uploads a work, states the creative intent, confirms the AI's reading, receives a focused critique across composition, value, color, and visual narrative, then uploads a revision for a before-and-after report.
@@ -106,7 +94,7 @@ The starter catalog contains Hokusai's *The Great Wave*, Vermeer's *Girl with a 
 
 See [Architecture](docs/ARCHITECTURE.md), [API](docs/API.md), and [Research roadmap](docs/RESEARCH.md).
 
-For the public deployment path, see [Hugging Face + Supabase deployment](docs/DEPLOYMENT.md).
+For the public deployment path, see [Render + Supabase deployment](docs/DEPLOYMENT.md).
 
 ## Project structure
 
