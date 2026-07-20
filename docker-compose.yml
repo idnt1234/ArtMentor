@@ -1,0 +1,71 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: artmentor
+      POSTGRES_USER: artmentor
+      POSTGRES_PASSWORD: artmentor-local
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U artmentor -d artmentor"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: artmentor
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-artmentor-local-password}
+    ports:
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://artmentor:artmentor-local@db:5432/artmentor
+      STORAGE_BACKEND: minio
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ACCESS_KEY: artmentor
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY:-artmentor-local-password}
+      MINIO_BUCKET: artmentor
+      AI_PROVIDER: ${AI_PROVIDER:-gptsapi}
+      GPTSAPI_KEY: ${GPTSAPI_KEY:-}
+      GPTSAPI_BASE_URL: ${GPTSAPI_BASE_URL:-https://api.gptsapi.net/v1}
+      GPTSAPI_MODEL: ${GPTSAPI_MODEL:-gpt-5.6-terra}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5.6-terra}
+      OPENAI_REASONING_EFFORT: ${OPENAI_REASONING_EFFORT:-low}
+      ALLOW_DEMO_FALLBACK: ${ALLOW_DEMO_FALLBACK:-true}
+      FRONTEND_ORIGIN: http://localhost:8080
+      SESSION_SECRET: ${SESSION_SECRET:-artmentor-compose-session-secret}
+      AI_RATE_LIMIT_PER_HOUR: ${AI_RATE_LIMIT_PER_HOUR:-20}
+      UPLOAD_RATE_LIMIT_PER_HOUR: ${UPLOAD_RATE_LIMIT_PER_HOUR:-10}
+      MAX_CONCURRENT_AI_REQUESTS: ${MAX_CONCURRENT_AI_REQUESTS:-2}
+    depends_on:
+      db:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  postgres_data:
+  minio_data:

@@ -1,0 +1,2 @@
+"""ArtMentor backend package."""
+
