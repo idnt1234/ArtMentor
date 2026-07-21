@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     frontend_origin: str = "http://localhost:5173"
     frontend_dist_dir: str | None = None
     max_upload_mb: int = 15
+    analysis_max_side: int = 1600
     session_secret: str = "artmentor-local-session-secret"
     session_cookie_secure: bool = False
     demo_access_code: str | None = None

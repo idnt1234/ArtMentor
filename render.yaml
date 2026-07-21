@@ -41,6 +41,8 @@ services:
         sync: false
       - key: MAX_UPLOAD_MB
         value: "10"
+      - key: ANALYSIS_MAX_SIDE
+        value: "1600"
       - key: AI_RATE_LIMIT_PER_HOUR
         value: "12"
       - key: UPLOAD_RATE_LIMIT_PER_HOUR

@@ -7,6 +7,50 @@ from PIL import Image
 from ..schemas import VisualMetrics
 
 
+METRICS_MAX_SIDE = 1024
+
+
+def _rgb_image(image: Image.Image) -> Image.Image:
+    """将透明插画铺在白底上，避免透明区域在 JPEG 中变黑。"""
+    has_alpha = image.mode in {"RGBA", "LA"} or (
+        image.mode == "P" and "transparency" in image.info
+    )
+    if not has_alpha:
+        return image.convert("RGB")
+    rgba = image.convert("RGBA")
+    background = Image.new("RGB", rgba.size, "white")
+    background.paste(rgba, mask=rgba.getchannel("A"))
+    return background
+
+
+def _thumbnail(image: Image.Image, max_side: int) -> None:
+    """优先让 JPEG 解码器降采样，再缩到分析需要的尺寸。"""
+    image.draft("RGB", (max_side, max_side))
+    image.thumbnail((max_side, max_side), Image.Resampling.LANCZOS)
+
+
+def prepare_analysis_image(
+    data: bytes, max_side: int = 1600, jpeg_quality: int = 90
+) -> tuple[bytes, str]:
+    """生成发送给视觉模型的轻量副本；存储中的用户原图保持不变。"""
+    with Image.open(io.BytesIO(data)) as image:
+        if max(image.size) <= max_side:
+            image_format = (image.format or "").lower()
+            mime = {
+                "jpeg": "image/jpeg",
+                "png": "image/png",
+                "webp": "image/webp",
+            }.get(image_format)
+            if mime:
+                return data, mime
+        _thumbnail(image, max_side)
+        rgb = _rgb_image(image)
+        output = io.BytesIO()
+        # 不启用 optimize，避免 Pillow 为节省少量流量再次增加峰值内存。
+        rgb.save(output, format="JPEG", quality=jpeg_quality)
+        return output.getvalue(), "image/jpeg"
+
+
 def validate_image(data: bytes, max_pixels: int = 30_000_000) -> tuple[int, int, str]:
     try:
         with Image.open(io.BytesIO(data)) as image:
@@ -38,8 +82,11 @@ def _hex_palette(rgb: np.ndarray, count: int = 5) -> list[str]:
 
 def compute_visual_metrics(data: bytes) -> VisualMetrics:
     with Image.open(io.BytesIO(data)) as image:
-        rgb = np.array(image.convert("RGB"))
-    height, width = rgb.shape[:2]
+        width, height = image.size
+        # 指标只需要全局结构；在受限尺寸上计算可避免 4K/8K 图像产生数百 MB 临时数组。
+        _thumbnail(image, METRICS_MAX_SIDE)
+        rgb = np.array(_rgb_image(image), dtype=np.uint8)
+    sample_height, sample_width = rgb.shape[:2]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
 
@@ -61,8 +108,8 @@ def compute_visual_metrics(data: bytes) -> VisualMetrics:
     edge_density = float(np.mean(edges > 0))
     y_coords, x_coords = np.nonzero(edges)
     if len(x_coords):
-        focal_x = float(np.mean(x_coords) / max(width - 1, 1))
-        focal_y = float(np.mean(y_coords) / max(height - 1, 1))
+        focal_x = float(np.mean(x_coords) / max(sample_width - 1, 1))
+        focal_y = float(np.mean(y_coords) / max(sample_height - 1, 1))
     else:
         focal_x = focal_y = 0.5
     thirds = [(1 / 3, 1 / 3), (2 / 3, 1 / 3), (1 / 3, 2 / 3), (2 / 3, 2 / 3)]
@@ -85,4 +132,3 @@ def compute_visual_metrics(data: bytes) -> VisualMetrics:
         thirds_distance=round(float(thirds_distance), 3),
         palette=_hex_palette(rgb),
     )
-

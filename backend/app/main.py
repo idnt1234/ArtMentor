@@ -29,7 +29,11 @@ from .schemas import (
     Suggestion,
 )
 from .services.ai import ArtMentorAI
-from .services.image_metrics import compute_visual_metrics, validate_image
+from .services.image_metrics import (
+    compute_visual_metrics,
+    prepare_analysis_image,
+    validate_image,
+)
 from .services.references import sample_by_id, samples, select_references
 from .services.storage import BlobStorage, build_storage
 from .security import (
@@ -393,11 +397,15 @@ def analyze_project(
     blobs = _storage()
     image_data = blobs.read(project.image_key)
     metrics = compute_visual_metrics(image_data)
+    analysis_image, analysis_mime = prepare_analysis_image(
+        image_data, settings.analysis_max_side
+    )
+    del image_data
     _limit_ai(http_request)
     with ai_guard.slot():
         generated = _ai().critique(
-            image=image_data,
-            mime=blobs.content_type(project.image_key),
+            image=analysis_image,
+            mime=analysis_mime,
             intent=request.confirmed_intent.strip(),
             style=project.style,
             stage=project.stage,
@@ -529,14 +537,21 @@ async def create_revision(
     after_data, suffix = await _read_upload(image)
     before_data = _storage().read(project.image_key)
     before_metrics = compute_visual_metrics(before_data)
+    before_analysis_image, before_analysis_mime = prepare_analysis_image(
+        before_data, settings.analysis_max_side
+    )
+    del before_data
     after_metrics = compute_visual_metrics(after_data)
+    after_analysis_image, after_analysis_mime = prepare_analysis_image(
+        after_data, settings.analysis_max_side
+    )
     _limit_ai(request)
     with ai_guard.slot():
         generated = _ai().compare(
-            before_image=before_data,
-            before_mime=_storage().content_type(project.image_key),
-            after_image=after_data,
-            after_mime=image.content_type or "image/jpeg",
+            before_image=before_analysis_image,
+            before_mime=before_analysis_mime,
+            after_image=after_analysis_image,
+            after_mime=after_analysis_mime,
             intent=project.intent_confirmed or project.intent_original,
             before_metrics=before_metrics,
             after_metrics=after_metrics,

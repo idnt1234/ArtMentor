@@ -51,6 +51,7 @@ The checked-in `render.yaml` supplies these non-secret variables:
 | `S3_AUTO_CREATE_BUCKET` | `false` |
 | `SESSION_COOKIE_SECURE` | `true` |
 | `MAX_UPLOAD_MB` | `10` |
+| `ANALYSIS_MAX_SIDE` | `1600` |
 | `AI_RATE_LIMIT_PER_HOUR` | `12` |
 | `UPLOAD_RATE_LIMIT_PER_HOUR` | `8` |
 | `MAX_CONCURRENT_AI_REQUESTS` | `1` |
