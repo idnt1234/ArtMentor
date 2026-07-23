@@ -1,3 +1,10 @@
+"""ArtMentor 核心 API 的端到端回归测试。
+
+测试通过 TestClient 驱动真实 FastAPI 路由、数据库和本地存储，但 conftest 会清空
+AI 密钥并启用确定性回退，因此不会访问公网或消耗额度。这里重点验证产品闭环和安全边界，
+不是单独测试某个函数的实现细节。
+"""
+
 import io
 
 from fastapi.testclient import TestClient
@@ -7,6 +14,7 @@ from app.main import app, settings
 
 
 def artwork_bytes(shift: int = 0) -> bytes:
+    """在内存中生成稳定测试图，避免测试依赖外部文件或网络。"""
     image = Image.new("RGB", (420, 300), "#20263d")
     draw = ImageDraw.Draw(image)
     draw.ellipse((145 + shift, 55, 300 + shift, 235), fill="#eab768")
@@ -16,6 +24,9 @@ def artwork_bytes(shift: int = 0) -> bytes:
 
 
 def test_complete_offline_critique_flow() -> None:
+    """一条测试覆盖从作品进入系统到修改版报告产出的完整主路径。"""
+    # 端到端覆盖：样例导入、上传、意图复述、点评、反馈、修改版比较。
+    # conftest 会清空真实密钥，因此本测试不会消耗任何 API 额度。
     with TestClient(app) as client:
         sample_asset = client.get("/api/sample-assets/wheat-field")
         assert sample_asset.status_code == 200
@@ -36,20 +47,30 @@ def test_complete_offline_critique_flow() -> None:
         assert created.status_code == 200, created.text
         project = created.json()
 
+        # 正式点评前必须经过“复述并确认意图”这一产品门槛。
         restated = client.post(f"/api/projects/{project['id']}/intent/restate")
         assert restated.status_code == 200
         assert restated.json()["provider"] == "demo"
+        assert restated.json()["action_status"] == "unknown"
+        assert restated.json()["stage_assessment"] == "consistent"
 
         analyzed = client.post(
             f"/api/projects/{project['id']}/analyze",
-            json={"confirmed_intent": restated.json()["restatement"]},
+            json={
+                "confirmed_intent": restated.json()["restatement"],
+                "confirmed_stage": "Gesture sketch",
+                "action_context": "The figure is intentionally reaching toward the face.",
+            },
         )
         assert analyzed.status_code == 200, analyzed.text
         analysis = analyzed.json()
         assert len(analysis["result"]["dimensions"]) == 4
         assert len(analysis["result"]["suggestions"]) <= 3
         assert len(analysis["result"]["references"]) == 3
+        assert analysis["result"]["confirmed_stage"] == "Gesture sketch"
+        assert "reaching" in analysis["result"]["confirmed_action"]
 
+        # intentional 反馈不仅是 UI 状态，还要持久化画师给出的设计理由。
         suggestion = analysis["result"]["suggestions"][0]
         feedback = client.post(
             f"/api/analyses/{analysis['id']}/feedback",
@@ -71,6 +92,8 @@ def test_complete_offline_critique_flow() -> None:
 
 
 def test_anonymous_sessions_cannot_read_each_others_projects() -> None:
+    """证明匿名使用不等于共享数据：清除会话后无法访问原项目和图片。"""
+    # 验证匿名模式不是“所有人共享历史”：身份由浏览器 Cookie 隔离。
     with TestClient(app) as client:
         created = client.post(
             "/api/projects",
@@ -97,6 +120,7 @@ def test_anonymous_sessions_cannot_read_each_others_projects() -> None:
 
 
 def test_production_frontend_is_served_when_built() -> None:
+    """构建产物存在时由 FastAPI 提供 SPA；纯后端 CI 中允许尚未构建。"""
     with TestClient(app) as client:
         response = client.get("/")
         # CI 可以只跑后端；本地完整验证时 frontend/dist 已由生产构建生成。
@@ -107,6 +131,8 @@ def test_production_frontend_is_served_when_built() -> None:
 
 
 def test_optional_access_code_unlocks_api_and_media_cookie() -> None:
+    """验证访问码先解锁 API，再由 HttpOnly Cookie 自动授权图片标签。"""
+    # 访问码保护共享 AI 预算；验证成功后由 HttpOnly Cookie 继续授权图片请求。
     settings.demo_access_code = "reviewer-test-code"
     try:
         with TestClient(app) as client:

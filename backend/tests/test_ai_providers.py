@@ -2,7 +2,13 @@ from types import SimpleNamespace
 
 from app.config import Settings
 from app.schemas import IntentCore, SuggestionDraft, VisualMetrics
-from app.services.ai import ArtMentorAI, CRITIQUE_SYSTEM_PROMPT, _demo_critique
+from app.services.ai import (
+    CONTEXT_AUDIT_SYSTEM_PROMPT,
+    CRITIQUE_SYSTEM_PROMPT,
+    ArtMentorAI,
+    _demo_critique,
+    _stage_rubric,
+)
 
 
 class FakeCompletions:
@@ -51,11 +57,33 @@ def test_gptsapi_uses_chat_completions_for_structured_intent() -> None:
         restatement="A quiet portrait with a warm focal point.",
         assumptions=["The warm accent is intentional."],
         confirmation_question="Is the face the intended first read?",
+        visual_observations=["The right hand is raised beside the head."],
+        action_status="ambiguous",
+        action_hypotheses=[
+            {
+                "label": "Adjusting the headset",
+                "visible_evidence": "The fingers overlap the ear device.",
+            },
+            {
+                "label": "A salute-like gesture",
+                "visible_evidence": "The hand is raised near the temple.",
+            },
+        ],
+        action_question="What is the raised hand doing?",
+        stage_assessment="consistent",
+        suggested_stage="Color rough",
+        stage_note="Broad colors are present while materials remain unresolved.",
     )
     client, completions = _fake_client(f"```json\n{payload.model_dump_json()}\n```")
     service.client = client
 
-    result = service.restate_intent("quiet warmth", "Painterly", "Color study")
+    result = service.restate_intent(
+        "quiet warmth",
+        "Painterly",
+        "Color rough",
+        image=b"safe-fake-image",
+        mime="image/png",
+    )
 
     assert result.provider == "gptsapi"
     assert result.model == "vision-test-model"
@@ -63,6 +91,9 @@ def test_gptsapi_uses_chat_completions_for_structured_intent() -> None:
     assert completions.calls[0]["model"] == "vision-test-model"
     assert completions.calls[0]["response_format"] == {"type": "json_object"}
     assert "Required JSON shape" in completions.calls[0]["messages"][0]["content"]
+    assert "Separate directly visible facts" in completions.calls[0]["messages"][0]["content"]
+    audit_content = completions.calls[0]["messages"][1]["content"]
+    assert audit_content[1]["type"] == "image_url"
 
 
 def test_gptsapi_critique_sends_standard_vision_content() -> None:
@@ -78,8 +109,9 @@ def test_gptsapi_critique_sends_standard_vision_content() -> None:
         mime="image/png",
         intent="Keep the figure isolated.",
         style="Graphic",
-        stage="Color study",
+        stage="Color rough",
         metrics=metrics,
+        action_context="The figure is adjusting the headset.",
     )
 
     content = completions.calls[0]["messages"][1]["content"]
@@ -87,6 +119,9 @@ def test_gptsapi_critique_sends_standard_vision_content() -> None:
     assert content[0]["type"] == "text"
     assert content[1]["type"] == "image_url"
     assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+    system_prompt = completions.calls[0]["messages"][0]["content"]
+    assert "Stage rubric — Color rough" in system_prompt
+    assert "Artist-confirmed action context" in system_prompt
 
 
 def test_invalid_gateway_output_uses_labeled_demo_fallback() -> None:
@@ -129,3 +164,19 @@ def test_critique_prompt_requires_plain_language_teaching_layers() -> None:
     assert "technical_term" in CRITIQUE_SYSTEM_PROMPT
     assert "plain_explanation" in CRITIQUE_SYSTEM_PROMPT
     assert "value as 明暗, never 价值" in CRITIQUE_SYSTEM_PROMPT
+
+
+def test_context_audit_separates_visible_facts_from_action_hypotheses() -> None:
+    assert "visual_observations must describe only visible pose" in CONTEXT_AUDIT_SYSTEM_PROMPT
+    assert "action_status=clear only" in CONTEXT_AUDIT_SYSTEM_PROMPT
+    assert "never silently override the artist" in CONTEXT_AUDIT_SYSTEM_PROMPT
+
+
+def test_stage_rubrics_define_in_scope_and_deferred_feedback() -> None:
+    gesture = _stage_rubric("Gesture sketch")
+    polishing = _stage_rubric("Polishing")
+
+    assert "line of action" in gesture
+    assert "Construction lines" in gesture
+    assert "final focal refinement" in polishing
+    assert "Do not apply final-polish standards" in _stage_rubric("Legacy study")

@@ -23,6 +23,16 @@ export interface IntentRestatement {
   restatement: string;
   assumptions: string[];
   confirmation_question: string;
+  visual_observations: string[];
+  action_status: "clear" | "ambiguous" | "unknown" | "not_applicable";
+  action_hypotheses: Array<{
+    label: string;
+    visible_evidence: string;
+  }>;
+  action_question?: string | null;
+  stage_assessment: "consistent" | "uncertain" | "mismatch";
+  suggested_stage?: string | null;
+  stage_note: string;
   provider: string;
   model: string;
 }
@@ -91,6 +101,8 @@ export interface CritiqueResult {
   provider: string;
   model: string;
   warning?: string | null;
+  confirmed_stage?: string;
+  confirmed_action?: string | null;
 }
 
 export interface Analysis {

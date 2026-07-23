@@ -1,3 +1,10 @@
+/**
+ * 前端页面编排层。
+ *
+ * App 保存“上传作品 → 确认意图 → 查看点评 → 反馈/上传修改版”的页面状态，
+ * 并通过 api.ts 调用后端。画布、参考作品和前后对比分别交给独立组件渲染，
+ * 因此这里主要负责业务流程，不负责网络协议或 AI Prompt。
+ */
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
@@ -35,8 +42,10 @@ import type {
   Suggestion,
 } from "./types";
 
+// 标注画布依赖 Konva，体积较大；只在点评结果出现后再加载，缩短首屏等待时间。
 const AnnotationCanvas = lazy(() => import("./components/AnnotationCanvas"));
 
+// 点评完成后的右侧内容页签，以及当前正在执行的互斥异步任务。
 type Tab = "critique" | "references" | "revision";
 type Busy = "upload" | "intent" | "analysis" | "revision" | null;
 
@@ -47,18 +56,34 @@ const DIMENSION_ICONS = {
   narrative: MessageSquareMore,
 };
 
-const STAGES = ["Thumbnail", "Sketch", "Color rough", "Rendering", "Polishing"];
+// 阶段必须足够具体，后端会据此选择不同的评价 Rubric；Sketch 保留给旧项目兼容。
+const STAGES = [
+  "Thumbnail",
+  "Gesture sketch",
+  "Structure / anatomy study",
+  "Character design sketch",
+  "Sketch",
+  "Clean line art",
+  "Color rough",
+  "Rendering",
+  "Polishing",
+];
 
 function formatDate(value: string) {
+  // 历史列表只显示便于扫读的月/日，完整时间仍由后端保存。
   return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(new Date(value));
 }
 
 function App() {
+  // 顶层组件相当于轻量状态机：哪些对象存在，决定用户当前看到哪个业务阶段。
+  // 这组状态描述完整业务阶段：作品 → 意图确认 → 点评 → 修改版对比。
   const [samples, setSamples] = useState<SampleArtwork[]>([]);
   const [history, setHistory] = useState<Project[]>([]);
   const [project, setProject] = useState<Project | null>(null);
   const [intentDraft, setIntentDraft] = useState<IntentRestatement | null>(null);
   const [confirmedIntent, setConfirmedIntent] = useState("");
+  const [confirmedStage, setConfirmedStage] = useState("Character design sketch");
+  const [confirmedAction, setConfirmedAction] = useState("");
   const [analysis, setAnalysis] = useState<Analysis | null>(null);
   const [revision, setRevision] = useState<Revision | null>(null);
   const [activeSuggestion, setActiveSuggestion] = useState<string | null>(null);
@@ -69,6 +94,7 @@ function App() {
   const [feedback, setFeedback] = useState<Record<string, string>>({});
   const [intentionalTarget, setIntentionalTarget] = useState<string | null>(null);
   const [intentionalReason, setIntentionalReason] = useState("");
+  // 公网 Demo 使用访问码控制共享 AI 额度；真正的数据隔离由后端匿名 Cookie 完成。
   const [accessRequired, setAccessRequired] = useState(false);
   const [accessCode, setAccessCode] = useState("");
   const [accessBusy, setAccessBusy] = useState(false);
@@ -76,7 +102,7 @@ function App() {
 
   const [form, setForm] = useState({
     title: "",
-    stage: "Sketch",
+    stage: "Character design sketch",
     style: "Digital illustration",
     intent: "",
   });
@@ -84,6 +110,7 @@ function App() {
   const previewUrl = useMemo(() => (uploadFile ? URL.createObjectURL(uploadFile) : null), [uploadFile]);
 
   useEffect(() => {
+    // 启动时先检查访问权限，通过后再并行加载样例与当前浏览器的历史项目。
     const bootstrap = async () => {
       const session = await api.session();
       if (session.access_required && !session.access_granted) {
@@ -98,12 +125,15 @@ function App() {
   }, []);
 
   useEffect(() => () => {
+    // createObjectURL 会占用浏览器内存，切换文件或离开组件时必须释放。
     if (previewUrl) URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
 
+  // 每次产生新项目或新点评后重新读取历史，确保侧栏与数据库一致。
   const refreshHistory = async () => setHistory(await api.projects());
 
   const unlockDemo = async () => {
+    // 访问码验证成功后，后端还会写入 HttpOnly Cookie，供后续图片请求使用。
     if (!accessCode.trim()) return;
     setAccessBusy(true);
     setError(null);
@@ -124,9 +154,12 @@ function App() {
   };
 
   const resetWorkspace = () => {
+    // 只清空当前工作区，不删除服务器中的历史项目。
     setProject(null);
     setIntentDraft(null);
     setConfirmedIntent("");
+    setConfirmedStage("Character design sketch");
+    setConfirmedAction("");
     setAnalysis(null);
     setRevision(null);
     setUploadFile(null);
@@ -135,24 +168,36 @@ function App() {
     setError(null);
   };
 
+  const applyContextDraft = (draft: IntentRestatement, declaredStage: string) => {
+    // 只有模型认为动作清楚时才预填；模糊动作必须由用户选择或保持未确认。
+    setIntentDraft(draft);
+    setConfirmedIntent(draft.restatement);
+    setConfirmedStage(declaredStage);
+    setConfirmedAction(draft.action_status === "clear" ? draft.action_hypotheses[0]?.label ?? "" : "");
+  };
+
   const loadProject = async (item: Project) => {
     setBusy("analysis");
     setError(null);
     try {
       setProject(item);
       setConfirmedIntent(item.intent_confirmed || item.intent_original);
+      setConfirmedStage(item.stage);
+      setConfirmedAction("");
       setIntentDraft(null);
       setRevision(null);
       setTab("critique");
+      // 有历史点评就直接恢复；否则从“复述意图”阶段继续，避免重复调用点评模型。
       if (item.latest_analysis_id) {
         const loaded = await api.analysis(item.latest_analysis_id);
         setAnalysis(loaded);
+        setConfirmedStage(loaded.result.confirmed_stage || item.stage);
+        setConfirmedAction(loaded.result.confirmed_action || "");
         setActiveSuggestion(loaded.result.suggestions[0]?.id ?? null);
       } else {
         setAnalysis(null);
         const restated = await api.restateIntent(item.id);
-        setIntentDraft(restated);
-        setConfirmedIntent(restated.restatement);
+        applyContextDraft(restated, item.stage);
       }
     } catch (cause) {
       setError((cause as Error).message);
@@ -170,6 +215,7 @@ function App() {
     setBusy("upload");
     setError(null);
     try {
+      // 先建立 Project，再让 AI 复述意图；用户确认之前不会进入正式点评。
       const payload = new FormData();
       payload.append("image", uploadFile);
       payload.append("title", form.title || uploadFile.name.replace(/\.[^.]+$/, ""));
@@ -179,8 +225,7 @@ function App() {
       const created = await api.createProject(payload);
       setProject(created);
       const restated = await api.restateIntent(created.id);
-      setIntentDraft(restated);
-      setConfirmedIntent(restated.restatement);
+      applyContextDraft(restated, created.stage);
       await refreshHistory();
     } catch (cause) {
       setError((cause as Error).message);
@@ -190,14 +235,14 @@ function App() {
   };
 
   const importSample = async (sampleId: string) => {
+    // 公共领域样例和用户上传走相同 Project/Intent/Analysis 流程，便于可靠演示。
     setBusy("upload");
     setError(null);
     try {
       const created = await api.importSample(sampleId);
       setProject(created);
       const restated = await api.restateIntent(created.id);
-      setIntentDraft(restated);
-      setConfirmedIntent(restated.restatement);
+      applyContextDraft(restated, created.stage);
       await refreshHistory();
     } catch (cause) {
       setError((cause as Error).message);
@@ -211,7 +256,8 @@ function App() {
     setBusy("analysis");
     setError(null);
     try {
-      const result = await api.analyze(project.id, confirmedIntent);
+      // confirmedIntent 是用户可编辑后的版本，也是后端点评时的最高优先级上下文。
+      const result = await api.analyze(project.id, confirmedIntent, confirmedStage, confirmedAction);
       setAnalysis(result);
       setIntentDraft(null);
       setActiveSuggestion(result.result.suggestions[0]?.id ?? null);
@@ -225,6 +271,7 @@ function App() {
 
   const updateRegion = (id: string, region: Suggestion["region"]) => {
     if (!analysis) return;
+    // 先更新本地画布保证拖拽流畅，再异步持久化归一化坐标。
     setAnalysis({
       ...analysis,
       result: {
@@ -238,6 +285,7 @@ function App() {
   const sendFeedback = async (suggestionId: string, verdict: string, reason?: string) => {
     if (!analysis) return;
     try {
+      // “Intentional + reason”是研究风格选择与技术失误边界的关键数据。
       await api.feedback(analysis.id, suggestionId, verdict, reason);
       setFeedback((current) => ({ ...current, [suggestionId]: verdict }));
       setIntentionalTarget(null);
@@ -248,6 +296,7 @@ function App() {
   };
 
   const uploadRevision = async (file: File) => {
+    // 后端同时读取原图和修改版，返回四维变化报告；前端只切换到对比页展示。
     if (!project || !analysis) return;
     setBusy("revision");
     setError(null);
@@ -263,6 +312,7 @@ function App() {
   };
 
   if (accessRequired) {
+    // 公网实例配置访问码时，先渲染独立门禁页，不加载任何私人项目。
     return (
       <AccessGate
         value={accessCode}
@@ -342,6 +392,10 @@ function App() {
             draft={intentDraft}
             value={confirmedIntent}
             onChange={setConfirmedIntent}
+            stage={confirmedStage}
+            onStageChange={setConfirmedStage}
+            action={confirmedAction}
+            onActionChange={setConfirmedAction}
             busy={busy}
             onConfirm={runAnalysis}
           />
@@ -433,6 +487,7 @@ function AccessGate({ value, onChange, onSubmit, busy, error }: {
   busy: boolean;
   error: string | null;
 }) {
+  // 共享 Demo 的预算门禁；它不是用户账号系统，匿名数据隔离仍由后端负责。
   return (
     <main className="access-shell">
       <section className="access-card">
@@ -468,6 +523,7 @@ interface UploadProps {
 }
 
 function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl, fileRef, samples, busy, onSubmit, onSample }: UploadProps) {
+  // 首屏收集模型理解作品所需的最小上下文，也提供无需上传的公共领域样例入口。
   const update = (key: keyof UploadProps["form"], value: string) => setForm((current) => ({ ...current, [key]: value }));
   return (
     <div className="onboarding">
@@ -498,7 +554,7 @@ function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl,
           {busy === "upload" ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
           Clarify my intent <ArrowRight size={17} />
         </button>
-        <p className="upload-privacy">Your artwork is stored for your private browser history and is sent to the configured AI provider only when you request a critique.</p>
+        <p className="upload-privacy">Your artwork is stored for your private browser history and is sent to the configured AI provider when you request the visual context check and critique.</p>
       </section>
 
       <section className="sample-section">
@@ -517,23 +573,97 @@ function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl,
   );
 }
 
-function IntentConfirmation({ project, draft, value, onChange, busy, onConfirm }: {
+function IntentConfirmation({ project, draft, value, onChange, stage, onStageChange, action, onActionChange, busy, onConfirm }: {
   project: Project;
   draft: IntentRestatement;
   value: string;
   onChange: (value: string) => void;
+  stage: string;
+  onStageChange: (value: string) => void;
+  action: string;
+  onActionChange: (value: string) => void;
   busy: Busy;
   onConfirm: () => void;
 }) {
+  // 把 AI 的意图复述做成可编辑门槛：用户确认后，这段文字才成为点评判断基准。
   return (
     <div className="intent-layout">
-      <div className="intent-art"><img src={assetUrl(project.image_url)} alt={project.title} /><div><span>{project.stage}</span><span>{project.style}</span></div></div>
+      <div className="intent-art"><img src={assetUrl(project.image_url)} alt={project.title} /><div><span>{stage}</span><span>{project.style}</span></div></div>
       <section className="intent-card">
-        <div className="step-label"><span>1</span> Confirm creative intent</div>
+        <div className="step-label"><span>1</span> Confirm what ArtMentor should assume</div>
         <p className="eyebrow">Before any critique</p>
         <h2>Let’s make sure we are looking at the same picture.</h2>
-        <p className="intent-explainer">The critique will treat this statement as its north star. Edit anything that feels off.</p>
-        <label className="intent-editor"><span>ArtMentor’s reading</span><textarea value={value} onChange={(event) => onChange(event.target.value)} rows={6} /></label>
+        <p className="intent-explainer">Confirm the stage, action, and intent first. Uncertain visual interpretations will not be treated as facts.</p>
+
+        <div className="perception-audit">
+          {draft.visual_observations.length > 0 && (
+            <div className="audit-block">
+              <span className="audit-label">Visible facts</span>
+              {draft.visual_observations.map((observation) => <p key={observation}><Check size={14} />{observation}</p>)}
+            </div>
+          )}
+
+          <label className="stage-confirmation">
+            <span className="audit-label">Critique stage</span>
+            <select value={stage} onChange={(event) => onStageChange(event.target.value)}>
+              {STAGES.map((item) => <option key={item}>{item}</option>)}
+            </select>
+            <small className={`audit-status ${draft.stage_assessment}`}>{draft.stage_assessment}</small>
+            {draft.stage_note && <p>{draft.stage_note}</p>}
+            {draft.suggested_stage && draft.suggested_stage !== stage && STAGES.includes(draft.suggested_stage) && (
+              <button className="stage-suggestion" onClick={() => onStageChange(draft.suggested_stage!)} type="button">
+                Use suggested stage: {draft.suggested_stage}
+              </button>
+            )}
+          </label>
+
+          {draft.action_status !== "not_applicable" && (
+            <div className="audit-block action-audit">
+              <div className="audit-heading">
+                <span className="audit-label">Character action</span>
+                <small className={`audit-status ${draft.action_status}`}>{draft.action_status}</small>
+              </div>
+              <p className="action-question">{draft.action_question || "What should this action be read as?"}</p>
+              {draft.action_hypotheses.length > 0 && (
+                <div className="action-options">
+                  {draft.action_hypotheses.map((hypothesis) => (
+                    <button
+                      key={hypothesis.label}
+                      className={action === hypothesis.label ? "selected" : ""}
+                      onClick={() => onActionChange(hypothesis.label)}
+                      title={hypothesis.visible_evidence}
+                      type="button"
+                    >
+                      {hypothesis.label}
+                    </button>
+                  ))}
+                  <button
+                    className={action === "The exact action is intentionally ambiguous." ? "selected" : ""}
+                    onClick={() => onActionChange("The exact action is intentionally ambiguous.")}
+                    type="button"
+                  >
+                    Keep it ambiguous
+                  </button>
+                </div>
+              )}
+              {draft.action_status === "ambiguous" && draft.action_hypotheses.length > 0 && (
+                <div className="hypothesis-evidence">
+                  {draft.action_hypotheses.map((hypothesis) => (
+                    <p key={hypothesis.label}><strong>{hypothesis.label}</strong>{hypothesis.visible_evidence}</p>
+                  ))}
+                </div>
+              )}
+              <input
+                className="action-context-input"
+                value={action}
+                onChange={(event) => onActionChange(event.target.value)}
+                placeholder="Describe the action, or leave blank if it should stay unknown"
+              />
+            </div>
+          )}
+        </div>
+
+        <label className="intent-editor"><span>ArtMentor’s reading of your intent</span><textarea value={value} onChange={(event) => onChange(event.target.value)} rows={6} /></label>
         {draft.assumptions.length > 0 && <div className="assumptions"><span>Assumptions to verify</span>{draft.assumptions.map((item) => <p key={item}><Check size={14} />{item}</p>)}</div>}
         <div className="confirmation-question"><Target size={18} /><p>{draft.confirmation_question}</p></div>
         <button className="primary-action" disabled={busy !== null} onClick={onConfirm}>
@@ -541,7 +671,7 @@ function IntentConfirmation({ project, draft, value, onChange, busy, onConfirm }
           Confirm and critique <ArrowRight size={17} />
         </button>
         <small className="model-note">
-          Intent restated by {draft.provider === "demo" ? "offline demo mode" : draft.provider === "gptsapi" ? `WildAI · ${draft.model}` : draft.model}
+          Visual context checked by {draft.provider === "demo" ? "offline demo mode" : draft.provider === "gptsapi" ? `WildAI · ${draft.model}` : draft.model}
         </small>
       </section>
     </div>
@@ -549,6 +679,7 @@ function IntentConfirmation({ project, draft, value, onChange, busy, onConfirm }
 }
 
 function LoadingAnalysis() {
+  // 视觉模型调用可能需要较长时间，用明确阶段文案代替空白页面。
   return <div className="loading-analysis"><div className="orbit"><span /><span /><Sparkles size={28} /></div><p className="eyebrow">Reading the artwork</p><h2>Building a focused critique…</h2><p>Composition · Value · Color · Narrative</p></div>;
 }
 
@@ -565,6 +696,8 @@ interface CritiquePanelProps {
 }
 
 function CritiquePanel(props: CritiquePanelProps) {
+  // 按“总评 → 四维概览 → 三条重点建议 → 针对性练习”展示结构化结果。
+  // 每条建议内部固定为术语、白话、目标和步骤，避免模型输出变成难懂的长段落。
   const result = props.analysis.result;
   return (
     <div className="panel-scroll critique-panel">

@@ -23,8 +23,8 @@ flowchart LR
 ## Workflow boundary
 
 1. Upload validates format, size, and pixels, then stores the original.
-2. Intent restatement is a text-only structured call. The artist edits and confirms it.
-3. Critique computes deterministic metrics and sends the image, confirmed intent, style, stage, and metrics to the vision model.
+2. A visual context audit separates visible facts from uncertain action hypotheses and checks whether the declared stage appears plausible. The artist confirms or edits the action, stage, and intent.
+3. Critique computes deterministic metrics and sends the image plus confirmed context to the vision model with a stage-specific rubric.
 4. The model returns a strict `CritiqueCore`. The backend assigns stable suggestion IDs and joins three references from a curated public-domain catalog.
 5. Annotation edits are saved as normalized coordinates, independent of screen or original image size.
 6. Feedback stores the suggestion, verdict, and optional reason. “Intentional” is a first-class label.

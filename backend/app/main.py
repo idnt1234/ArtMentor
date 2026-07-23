@@ -1,3 +1,13 @@
+"""ArtMentor 的 FastAPI 应用编排层。
+
+本模块连接 HTTP 接口、匿名会话、数据库、对象存储、图片预处理和 AI 服务。
+一次正式点评的主链路是：验证访问权限与项目归属 → 读取并缩放图片 → 计算辅助指标
+→ 调用视觉模型 → 匹配合法参考作品 → 保存结构化点评 → 返回前端。
+
+具体 Prompt 在 services/ai.py，数据形状在 schemas.py，数据库表在 models.py；
+main.py 只负责安排调用顺序和处理接口错误。
+"""
+
 import uuid
 import hmac
 from contextlib import asynccontextmanager
@@ -46,6 +56,7 @@ from .security import (
 
 
 settings = get_settings()
+# storage 与 ai 在应用启动阶段创建，路由通过辅助函数取得已初始化实例。
 storage: BlobStorage | None = None
 ai: ArtMentorAI | None = None
 ai_guard = AIGuard(settings)
@@ -53,6 +64,7 @@ ai_guard = AIGuard(settings)
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    """应用启动时建表/迁移，并初始化对象存储和 AI 客户端。"""
     global storage, ai
     settings.ensure_local_dirs()
     Base.metadata.create_all(bind=engine)
@@ -80,6 +92,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ------------------------- 匿名会话与 Demo 门禁 -------------------------
 
 @app.middleware("http")
 async def anonymous_session(request: Request, call_next):
@@ -149,22 +163,26 @@ async def anonymous_session(request: Request, call_next):
 
 
 def _storage() -> BlobStorage:
+    """返回启动期创建的存储适配器；尚未就绪时统一返回 503。"""
     if storage is None:
         raise HTTPException(503, "Storage is still starting.")
     return storage
 
 
 def _ai() -> ArtMentorAI:
+    """返回 AI 供应商适配器，让路由无需判断当前使用 WildAI 还是 OpenAI。"""
     if ai is None:
         raise HTTPException(503, "AI service is still starting.")
     return ai
 
 
 def _media_url(key: str) -> str:
+    """数据库只保存对象键，接口响应再转换为受权限保护的图片 URL。"""
     return f"{settings.api_prefix}/media/{key}"
 
 
 def _owned_project(db: Session, project_id: str, owner_id: str) -> Project:
+    """同时按项目 ID 和匿名 owner_id 查询，防止访客读取他人项目。"""
     project = db.scalar(
         select(Project).where(Project.id == project_id, Project.owner_id == owner_id)
     )
@@ -174,6 +192,7 @@ def _owned_project(db: Session, project_id: str, owner_id: str) -> Project:
 
 
 def _owned_analysis(db: Session, analysis_id: str, owner_id: str) -> Analysis:
+    """经 Project 关联检查点评归属，避免只猜到 analysis_id 就能越权。"""
     analysis = db.scalar(
         select(Analysis)
         .join(Project, Analysis.project_id == Project.id)
@@ -185,10 +204,12 @@ def _owned_analysis(db: Session, analysis_id: str, owner_id: str) -> Analysis:
 
 
 def _limit_ai(request: Request) -> None:
+    """在真正调用收费模型前执行按来源限流。"""
     ai_guard.check_rate(request)
 
 
 async def _read_upload(upload: UploadFile) -> tuple[bytes, str]:
+    """读取上传文件，并统一校验非空、大小、真实图片格式和允许的扩展名。"""
     data = await upload.read()
     if not data:
         raise HTTPException(400, "The image is empty.")
@@ -205,6 +226,7 @@ async def _read_upload(upload: UploadFile) -> tuple[bytes, str]:
 
 
 def _project_response(project: Project) -> ProjectCreateResponse:
+    """把数据库 Project 转成前端需要的公开响应，隐藏 owner_id 和存储键。"""
     return ProjectCreateResponse(
         id=project.id,
         title=project.title,
@@ -216,8 +238,11 @@ def _project_response(project: Project) -> ProjectCreateResponse:
     )
 
 
+# ------------------------- 健康检查、会话与图片资源 -------------------------
+
 @app.get(f"{settings.api_prefix}/health")
 def health() -> dict:
+    """供 Render 健康检查使用，不访问用户数据，也不触发 AI 调用。"""
     return {
         "status": "ok",
         "ai_provider": settings.ai_provider,
@@ -230,6 +255,7 @@ def health() -> dict:
 
 @app.get(f"{settings.api_prefix}/session")
 def session_ready(request: Request) -> dict[str, bool]:
+    """告诉前端当前实例是否需要访问码，以及本次会话是否已经通过。"""
     return {
         "ready": True,
         "access_required": bool(settings.demo_access_code),
@@ -243,6 +269,7 @@ def media(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> Response:
+    """仅向所属匿名会话返回原图/修改版，避免对象存储地址直接公开。"""
     safe_key = Path(key).name
     owns_original = db.scalar(
         select(Project.id).where(
@@ -268,13 +295,17 @@ def media(
     )
 
 
+# ------------------------- 公共领域样例 -------------------------
+
 @app.get(f"{settings.api_prefix}/samples", response_model=list[SampleArtwork])
 def list_samples() -> list[SampleArtwork]:
+    """返回可用于演示的公共领域作品元数据。"""
     return samples()
 
 
 @app.get(f"{settings.api_prefix}/sample-assets/{{sample_id}}")
 def sample_asset(sample_id: str) -> Response:
+    """提供随项目打包的样例图片；这些资源本身可以公开缓存。"""
     sample = sample_by_id(sample_id)
     if sample is None:
         raise HTTPException(404, "Sample not found.")
@@ -298,6 +329,7 @@ def import_sample(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> ProjectCreateResponse:
+    """把公共领域样例复制成当前访客自己的 Project，后续流程与上传一致。"""
     ai_guard.check_upload(request)
     sample = sample_by_id(sample_id)
     if sample is None:
@@ -327,6 +359,8 @@ def import_sample(
     return _project_response(project)
 
 
+# ------------------------- 项目创建与意图确认 -------------------------
+
 @app.post(f"{settings.api_prefix}/projects", response_model=ProjectCreateResponse)
 async def create_project(
     request: Request,
@@ -338,6 +372,7 @@ async def create_project(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> ProjectCreateResponse:
+    """验证并保存原图，同时建立后续意图、点评和修改记录的根 Project。"""
     ai_guard.check_upload(request)
     if len(intent.strip()) < 8:
         raise HTTPException(
@@ -370,17 +405,29 @@ def restate_intent(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> IntentRestatement:
+    """先看图核对动作与阶段，再澄清意图；此阶段仍不评价作品好坏。"""
     project = _owned_project(db, project_id, owner_id)
+    image_data = _storage().read(project.image_key)
+    analysis_image, analysis_mime = prepare_analysis_image(
+        image_data, settings.analysis_max_side
+    )
+    del image_data
     _limit_ai(request)
     with ai_guard.slot():
         generated = _ai().restate_intent(
-            project.intent_original, project.style, project.stage
+            project.intent_original,
+            project.style,
+            project.stage,
+            image=analysis_image,
+            mime=analysis_mime,
         )
     core = generated.value
     return IntentRestatement(
         **core.model_dump(), provider=generated.provider, model=generated.model
     )
 
+
+# ------------------------- 正式点评与标注 -------------------------
 
 @app.post(
     f"{settings.api_prefix}/projects/{{project_id}}/analyze",
@@ -393,9 +440,15 @@ def analyze_project(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> AnalysisResponse:
+    """执行正式点评主链路：鉴权 → 读图 → 指标/缩放 → AI → 参考作品 → 入库。"""
     project = _owned_project(db, project_id, owner_id)
+    confirmed_stage = (request.confirmed_stage or project.stage).strip()
+    confirmed_action = (
+        request.action_context.strip() if request.action_context else None
+    )
     blobs = _storage()
     image_data = blobs.read(project.image_key)
+    # 指标保留原始宽高，但在缩略图上计算；模型也只接收受限尺寸副本，控制内存。
     metrics = compute_visual_metrics(image_data)
     analysis_image, analysis_mime = prepare_analysis_image(
         image_data, settings.analysis_max_side
@@ -408,10 +461,12 @@ def analyze_project(
             mime=analysis_mime,
             intent=request.confirmed_intent.strip(),
             style=project.style,
-            stage=project.stage,
+            stage=confirmed_stage,
             metrics=metrics,
+            action_context=confirmed_action,
         )
     core = generated.value
+    # AI 只生成 ReferenceGoal，真正展示的作品从合法的公共领域目录中匹配。
     suggestions = [
         Suggestion(id=f"suggestion-{index + 1}", **item.model_dump())
         for index, item in enumerate(core.suggestions[:3])
@@ -428,8 +483,11 @@ def analyze_project(
         provider=generated.provider,
         model=generated.model,
         warning=generated.warning,
+        confirmed_stage=confirmed_stage,
+        confirmed_action=confirmed_action,
     )
     project.intent_confirmed = request.confirmed_intent.strip()
+    project.stage = confirmed_stage
     analysis = Analysis(
         project_id=project.id,
         result_json=result.model_dump_json(),
@@ -455,6 +513,7 @@ def get_analysis(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> AnalysisResponse:
+    """从 JSON 快照恢复一份历史点评，供前端重新打开项目。"""
     analysis = _owned_analysis(db, analysis_id, owner_id)
     return AnalysisResponse(
         id=analysis.id,
@@ -475,6 +534,7 @@ def update_annotation(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> AnalysisResponse:
+    """保存用户在画布上拖动后的归一化建议区域，不重新调用 AI。"""
     analysis = _owned_analysis(db, analysis_id, owner_id)
     result = CritiqueResult.model_validate_json(analysis.result_json)
     suggestion = next(
@@ -494,6 +554,8 @@ def update_annotation(
     )
 
 
+# ------------------------- 用户反馈与修改版闭环 -------------------------
+
 @app.post(
     f"{settings.api_prefix}/analyses/{{analysis_id}}/feedback",
     response_model=FeedbackResponse,
@@ -504,6 +566,7 @@ def create_feedback(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> FeedbackResponse:
+    """保存单条建议的 useful/not useful/intentional 判断及可选理由。"""
     _owned_analysis(db, analysis_id, owner_id)
     feedback = Feedback(
         analysis_id=analysis_id,
@@ -529,6 +592,7 @@ async def create_revision(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> RevisionResponse:
+    """保存修改版，并让模型按相同四维结构比较 before/after。"""
     ai_guard.check_upload(request)
     project = _owned_project(db, project_id, owner_id)
     analysis = _owned_analysis(db, base_analysis_id, owner_id)
@@ -585,11 +649,14 @@ async def create_revision(
     )
 
 
+# ------------------------- 历史列表与前端静态页面 -------------------------
+
 @app.get(f"{settings.api_prefix}/projects", response_model=list[ProjectSummary])
 def list_projects(
     owner_id: str = Depends(request_owner),
     db: Session = Depends(get_db),
 ) -> list[ProjectSummary]:
+    """返回当前匿名会话最近 50 个项目，并附上各自最新点评 ID。"""
     projects = db.scalars(
         select(Project)
         .where(Project.owner_id == owner_id)
@@ -632,6 +699,7 @@ if (frontend_dist / "assets").is_dir():
 
 @app.get("/{full_path:path}", include_in_schema=False)
 def frontend_spa(full_path: str):
+    """同一容器托管 React 构建产物，并为前端路由回退到 index.html。"""
     if not (frontend_dist / "index.html").is_file():
         raise HTTPException(404, "Frontend build not found.")
     candidate = (frontend_dist / full_path).resolve()

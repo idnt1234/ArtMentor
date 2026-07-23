@@ -1,23 +1,34 @@
+/**
+ * 前端统一 API 客户端。
+ *
+ * 页面组件只调用下方 api 对象；本文件集中处理部署地址、Demo 访问码、
+ * 匿名会话 Cookie、JSON 序列化和统一错误信息，避免这些细节散落在 UI 中。
+ */
 import type { Analysis, IntentRestatement, Project, Rect, Revision, SampleArtwork } from "./types";
 
+// 生产环境前后端同域使用 /api；本地也可通过 Vite 环境变量连接独立后端。
 const API_ROOT = import.meta.env.VITE_API_URL ?? "/api";
 const ACCESS_CODE_KEY = "artmentor_demo_access_code";
 
 export function setDemoAccessCode(value: string): void {
+  // 访问码只保存在当前标签页，刷新可用，关闭标签后自动消失。
   if (value.trim()) sessionStorage.setItem(ACCESS_CODE_KEY, value.trim());
   else sessionStorage.removeItem(ACCESS_CODE_KEY);
 }
 
 export function assetUrl(path: string): string {
+  // 本地开发可能前后端分端口，生产环境则同域；这里统一拼接图片地址。
   if (/^https?:\/\//.test(path)) return path;
   if (API_ROOT === "/api") return path;
   return `${API_ROOT.replace(/\/api$/, "")}${path}`;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  // 所有接口共享同一套请求与错误处理，泛型 T 让调用方得到正确的 TypeScript 类型。
   const headers = new Headers(init?.headers);
   const accessCode = sessionStorage.getItem(ACCESS_CODE_KEY);
   if (accessCode) headers.set("X-ArtMentor-Access-Code", accessCode);
+  // credentials: include 让匿名会话 Cookie 随请求发送，后端据此隔离不同访客。
   const response = await fetch(`${API_ROOT}${path}`, {
     credentials: "include",
     ...init,
@@ -36,19 +47,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+// 页面组件只依赖这个对象，不直接关心 URL、Header、Cookie 和错误解析细节。
 export const api = {
+  // 启动与历史：判断门禁状态，读取样例和当前匿名会话的项目。
   session: () => request<{ ready: boolean; access_required: boolean; access_granted: boolean }>("/session"),
   samples: () => request<SampleArtwork[]>("/samples"),
   projects: () => request<Project[]>("/projects"),
+  // 项目与意图：先保存作品，再单独复述意图，尚未执行正式视觉点评。
   importSample: (id: string) => request<Project>(`/samples/${id}/import`, { method: "POST" }),
   createProject: (form: FormData) => request<Project>("/projects", { method: "POST", body: form }),
   restateIntent: (projectId: string) =>
     request<IntentRestatement>(`/projects/${projectId}/intent/restate`, { method: "POST" }),
-  analyze: (projectId: string, confirmedIntent: string) =>
+  // 点评与反馈：analyze 会触发视觉模型；标注位置和反馈会继续写回后端。
+  analyze: (projectId: string, confirmedIntent: string, confirmedStage: string, actionContext?: string) =>
     request<Analysis>(`/projects/${projectId}/analyze`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ confirmed_intent: confirmedIntent }),
+      body: JSON.stringify({
+        confirmed_intent: confirmedIntent,
+        confirmed_stage: confirmedStage,
+        action_context: actionContext?.trim() || null,
+      }),
     }),
   analysis: (analysisId: string) => request<Analysis>(`/analyses/${analysisId}`),
   updateAnnotation: (analysisId: string, suggestionId: string, region: Rect) =>
@@ -63,6 +82,7 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ suggestion_id: suggestionId, verdict, reason: reason || null }),
     }),
+  // 修改版上传使用 multipart/form-data，并指定它要对照的基础点评。
   revision: (projectId: string, analysisId: string, file: File) => {
     const form = new FormData();
     form.append("base_analysis_id", analysisId);

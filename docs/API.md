@@ -11,8 +11,8 @@ Interactive OpenAPI documentation is exposed at `/docs` by FastAPI.
 | `POST` | `/api/samples/{id}/import` | Download a sample into a local project |
 | `POST` | `/api/projects` | Upload an artwork plus stage, style, and original intent |
 | `GET` | `/api/projects` | Recent project history |
-| `POST` | `/api/projects/{id}/intent/restate` | Generate the confirmation-ready intent reading |
-| `POST` | `/api/projects/{id}/analyze` | Confirm intent and run the four-dimensional critique |
+| `POST` | `/api/projects/{id}/intent/restate` | Visually audit action/stage uncertainty and generate the confirmation-ready intent reading |
+| `POST` | `/api/projects/{id}/analyze` | Confirm intent, stage, and optional action context, then run the stage-aware critique |
 | `GET` | `/api/analyses/{id}` | Load a saved analysis |
 | `PATCH` | `/api/analyses/{id}/suggestions/{id}` | Persist a corrected normalized rectangle |
 | `POST` | `/api/analyses/{id}/feedback` | Store useful, not useful, or intentional feedback |

@@ -72,7 +72,7 @@ After Render reports **Live**:
 
 - The anonymous HttpOnly cookie separates visitors without collecting an email or username.
 - Clearing that cookie makes the old history inaccessible to that browser; it does not delete the stored data. Account login and self-service deletion belong in the next version.
-- Uploaded images are private application objects, but they are sent to the configured vision provider when the user explicitly starts a critique.
+- Uploaded images are private application objects, but they are sent to the configured vision provider for the requested visual context check and again for the confirmed critique.
 - Rate limits are in memory and reset when the service restarts. The access code is the main cost-control boundary for this MVP.
 - Render's local filesystem is not used for production data, so sleep or rebuild does not remove Supabase records or images.
 - A free Render service sleeps after 15 minutes without inbound traffic. Its first request after sleep can take about a minute while the container starts.

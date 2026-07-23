@@ -4,6 +4,32 @@ ArtMentor is an intent-aware critique workspace for digital illustration. An art
 
 The MVP is designed as a portfolio, competition, and future research project—not as an autonomous judge of artistic quality. It explicitly records when the artist says an apparent “problem” is an intentional design choice.
 
+## 中文代码阅读指南
+
+如果你想理解项目如何实现，建议先沿着一条完整请求阅读，而不是从文件树逐个看：
+
+```text
+App.tsx 页面状态与交互
+  → api.ts 统一发送请求
+  → main.py 校验会话、图片和参数
+  → ai.py 组织 Prompt、调用视觉模型并校验结构化输出
+  → schemas.py 定义前后端数据契约
+  → models.py 持久化项目、点评、反馈和修改版
+  → test_api_flow.py 验证整个闭环
+```
+
+| 核心文件 | 负责的功能 |
+| --- | --- |
+| `frontend/src/App.tsx` | 页面总控和前端状态机：上传、意图确认、点评、反馈、修改版对比 |
+| `frontend/src/api.ts` | 前端唯一的 HTTP 请求入口，统一处理 URL、访问码、匿名 Cookie 和错误 |
+| `backend/app/main.py` | FastAPI 应用编排层：路由、鉴权、图片处理、AI 调用、数据库写入和静态页面托管 |
+| `backend/app/services/ai.py` | AI 供应商适配、Prompt、图片输入、结构化输出校验和离线演示回退 |
+| `backend/app/schemas.py` | Pydantic 数据契约，限制模型输出和接口数据的字段、数量与取值范围 |
+| `backend/app/models.py` | SQLAlchemy 数据表，保存作品项目、点评快照、用户反馈和修改版报告 |
+| `backend/tests/test_api_flow.py` | 不消耗 API 额度的端到端测试，覆盖闭环、数据隔离、访问码和前端托管 |
+
+README 主体保持英文，便于 GitHub 展示；上述核心文件内补有中文模块与关键流程注释。
+
 ## What the MVP demonstrates
 
 - Multimodal reasoning through a provider adapter: WildAI / GPTsAPI Chat Completions or the official OpenAI Responses API
@@ -85,7 +111,7 @@ The starter catalog contains Hokusai's *The Great Wave*, Vermeer's *Girl with a 
 
 ## AI behavior and privacy
 
-- Uploaded images are sent to the selected AI provider only after the artist confirms the restated intent and starts the critique.
+- Uploaded images are sent to the selected AI provider when the artist requests the pre-critique visual context check, and again when the artist confirms the context and starts the critique.
 - The original and confirmed intent, generated analysis, annotations, feedback, and revision report are stored locally in the configured database/object store.
 - `ALLOW_DEMO_FALLBACK=true` catches provider errors and returns labeled deterministic feedback. Set it to `false` when API failures should be explicit.
 - WildAI / GPTsAPI is a third-party relay. Its published policy says request content is relayed upstream and is not durably stored by GPTsAPI, but transient fragments may appear in short-term error logs and upstream handling is governed by the selected model provider. Do not upload confidential or unlicensed work without the artist's consent.
