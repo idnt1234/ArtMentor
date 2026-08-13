@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import math
 from typing import Protocol
 
 import httpx
@@ -86,8 +87,24 @@ class WorkerPoseClient:
                 timeout=self.timeout,
             )
             response.raise_for_status()
-            return PoseSkeleton.model_validate(response.json())
-        except (httpx.HTTPError, ValueError) as exc:
+            payload = response.json()
+            # SimCC confidence is a ranking signal rather than a calibrated
+            # probability. A real checkpoint may return a finite value just
+            # outside [0, 1], while the editable platform contract deliberately
+            # uses that bounded interval. Normalize only this metadata; never
+            # alter the predicted joint coordinates here.
+            if isinstance(payload, dict) and isinstance(
+                payload.get("keypoints"), list
+            ):
+                for point in payload["keypoints"]:
+                    if not isinstance(point, dict) or "confidence" not in point:
+                        continue
+                    confidence = float(point["confidence"])
+                    if not math.isfinite(confidence):
+                        raise ValueError("Pose confidence must be finite.")
+                    point["confidence"] = max(0.0, min(1.0, confidence))
+            return PoseSkeleton.model_validate(payload)
+        except (httpx.HTTPError, TypeError, ValueError) as exc:
             raise PoseClientError(
                 "Pose worker is unavailable or returned an invalid skeleton. "
                 "Try the body check again after the GPU service is ready."

@@ -144,7 +144,11 @@ class PoseRuntime:
                 # those rare extrapolations to the editable image boundary.
                 "x": round(max(0.0, min(1.0, float(point[0]) / width)), 8),
                 "y": round(max(0.0, min(1.0, float(point[1]) / height)), 8),
-                "confidence": round(float(score), 8),
+                # SimCC scores are useful ranking signals but are not guaranteed
+                # to be calibrated probabilities. Keep the HTTP contract stable.
+                "confidence": round(
+                    max(0.0, min(1.0, float(score))), 8
+                ),
                 "source": "model",
                 "visibility": "predicted",
             }
