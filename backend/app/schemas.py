@@ -74,6 +74,168 @@ class AnnotationUpdateRequest(BaseModel):
     region: Rect
 
 
+# ------------------------- 参考图人体结构检查 -------------------------
+
+PoseStyleMode = Literal[
+    "realistic", "semi_realistic", "stylized", "intentional_distortion"
+]
+PoseStatus = Literal["created", "estimated", "confirmed", "compared"]
+PoseFindingStatus = Literal["consistent", "suspicious", "insufficient"]
+
+COCO17_KEYPOINTS = (
+    "nose",
+    "left_eye",
+    "right_eye",
+    "left_ear",
+    "right_ear",
+    "left_shoulder",
+    "right_shoulder",
+    "left_elbow",
+    "right_elbow",
+    "left_wrist",
+    "right_wrist",
+    "left_hip",
+    "right_hip",
+    "left_knee",
+    "right_knee",
+    "left_ankle",
+    "right_ankle",
+)
+
+
+class PoseKeypoint(BaseModel):
+    """一个 COCO-17 关键点；坐标始终相对整张图片归一化。"""
+
+    name: str
+    x: float = Field(ge=0, le=1)
+    y: float = Field(ge=0, le=1)
+    confidence: float = Field(ge=0, le=1)
+    source: Literal["model", "user"] = "model"
+    visibility: Literal["predicted", "visible", "hidden", "unknown"] = "predicted"
+
+    @field_validator("name")
+    @classmethod
+    def known_keypoint(cls, value: str) -> str:
+        if value not in COCO17_KEYPOINTS:
+            raise ValueError(f"Unknown COCO-17 keypoint: {value}")
+        return value
+
+
+class PoseSkeleton(BaseModel):
+    """单人的可编辑骨架。比较前必须由用户确认双方关键点。"""
+
+    bbox: Rect
+    keypoints: list[PoseKeypoint] = Field(min_length=17, max_length=17)
+    confirmed: bool = False
+    warnings: list[str] = Field(default_factory=list, max_length=12)
+    model: str = ""
+
+    @model_validator(mode="after")
+    def unique_complete_keypoints(self):
+        names = [item.name for item in self.keypoints]
+        if len(set(names)) != 17 or set(names) != set(COCO17_KEYPOINTS):
+            raise ValueError("Pose skeleton must contain each COCO-17 keypoint once.")
+        return self
+
+
+class PoseEstimateRequest(BaseModel):
+    """用户框选作品和参考图中的同一个主体，再分别执行 top-down 姿态估计。"""
+
+    artwork_bbox: Rect
+    reference_bbox: Rect
+
+    @model_validator(mode="after")
+    def boxes_inside_images(self):
+        for label, box in (
+            ("artwork", self.artwork_bbox),
+            ("reference", self.reference_bbox),
+        ):
+            if box.x + box.width > 1 or box.y + box.height > 1:
+                raise ValueError(f"The {label} bounding box must stay inside its image.")
+        return self
+
+
+class PoseSkeletonUpdateRequest(BaseModel):
+    """保存用户拖动、显隐调整并确认后的两份骨架。"""
+
+    artwork_skeleton: PoseSkeleton
+    reference_skeleton: PoseSkeleton
+
+
+class PoseFinding(BaseModel):
+    """一条可追溯到关键点和数值残差的比较结论。"""
+
+    status: PoseFindingStatus
+    category: Literal["position", "proportion", "angle", "alignment", "evidence"]
+    title: str
+    observation: str
+    reference: str
+    difference: str
+    keypoints: list[str] = Field(default_factory=list, max_length=17)
+    confidence: float = Field(ge=0, le=1)
+    suggestion: str
+
+
+class PoseComparisonResult(BaseModel):
+    """确定性几何比较结果；它描述相对参考的偏差，不声称人体绝对正确。"""
+
+    overall_status: PoseFindingStatus
+    assumptions: list[str]
+    findings: list[PoseFinding]
+    comparable_keypoint_count: int = Field(ge=0, le=17)
+    tolerance_mode: PoseStyleMode
+
+
+class PoseComparisonResponse(BaseModel):
+    """参考检查的持久化快照，支持刷新后继续编辑或查看结果。"""
+
+    id: str
+    project_id: str
+    artwork_image_url: str
+    reference_image_url: str
+    reference_filename: str
+    style_mode: PoseStyleMode
+    status: PoseStatus
+    artwork_skeleton: PoseSkeleton | None = None
+    reference_skeleton: PoseSkeleton | None = None
+    result: PoseComparisonResult | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class PoseInspectionEstimateRequest(BaseModel):
+    """作品自检的单人区域和风格容差；不需要参考图。"""
+
+    bbox: Rect
+    style_mode: PoseStyleMode = "semi_realistic"
+
+    @model_validator(mode="after")
+    def box_inside_image(self):
+        if self.bbox.x + self.bbox.width > 1 or self.bbox.y + self.bbox.height > 1:
+            raise ValueError("The person bounding box must stay inside the image.")
+        return self
+
+
+class PoseInspectionUpdateRequest(BaseModel):
+    """保存用户修正后的作品骨架。"""
+
+    skeleton: PoseSkeleton
+
+
+class PoseInspectionResponse(BaseModel):
+    """作品级人体自检快照；结果只表示无参考条件下的2D自洽性。"""
+
+    id: str
+    project_id: str
+    artwork_image_url: str
+    style_mode: PoseStyleMode
+    status: Literal["estimated", "confirmed", "checked"]
+    skeleton: PoseSkeleton
+    result: PoseComparisonResult | None = None
+    created_at: datetime
+    updated_at: datetime
+
+
 # ------------------------- AI 点评核心结构 -------------------------
 
 class DimensionAnalysis(BaseModel):

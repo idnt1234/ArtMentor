@@ -22,7 +22,14 @@ from sqlalchemy.orm import Session
 
 from .config import get_settings
 from .database import Base, engine, get_db, migrate_database
-from .models import Analysis, Feedback, Project, Revision
+from .models import (
+    Analysis,
+    Feedback,
+    PoseComparison,
+    PoseInspection,
+    Project,
+    Revision,
+)
 from .schemas import (
     AnalysisResponse,
     AnnotationUpdateRequest,
@@ -32,6 +39,14 @@ from .schemas import (
     FeedbackRequest,
     FeedbackResponse,
     IntentRestatement,
+    PoseComparisonResponse,
+    PoseComparisonResult,
+    PoseEstimateRequest,
+    PoseInspectionEstimateRequest,
+    PoseInspectionResponse,
+    PoseInspectionUpdateRequest,
+    PoseSkeleton,
+    PoseSkeletonUpdateRequest,
     ProjectCreateResponse,
     ProjectSummary,
     RevisionResponse,
@@ -45,6 +60,9 @@ from .services.image_metrics import (
     validate_image,
 )
 from .services.references import sample_by_id, samples, select_references
+from .services.pose_client import PoseClient, PoseClientError, build_pose_client
+from .services.pose_compare import compare_skeletons
+from .services.pose_inspect import inspect_skeleton
 from .services.storage import BlobStorage, build_storage
 from .security import (
     AIGuard,
@@ -59,18 +77,20 @@ settings = get_settings()
 # storage 与 ai 在应用启动阶段创建，路由通过辅助函数取得已初始化实例。
 storage: BlobStorage | None = None
 ai: ArtMentorAI | None = None
+pose_client: PoseClient | None = None
 ai_guard = AIGuard(settings)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """应用启动时建表/迁移，并初始化对象存储和 AI 客户端。"""
-    global storage, ai
+    global storage, ai, pose_client
     settings.ensure_local_dirs()
     Base.metadata.create_all(bind=engine)
     migrate_database()
     storage = build_storage(settings)
     ai = ArtMentorAI(settings)
+    pose_client = build_pose_client(settings)
     yield
 
 
@@ -176,6 +196,15 @@ def _ai() -> ArtMentorAI:
     return ai
 
 
+def _pose_client() -> PoseClient:
+    """返回独立姿态服务客户端；禁用或尚未启动时不给出猜测结果。"""
+    if not settings.pose_feature_enabled:
+        raise HTTPException(503, "Reference pose checking is disabled.")
+    if pose_client is None:
+        raise HTTPException(503, "Pose service is still starting.")
+    return pose_client
+
+
 def _media_url(key: str) -> str:
     """数据库只保存对象键，接口响应再转换为受权限保护的图片 URL。"""
     return f"{settings.api_prefix}/media/{key}"
@@ -201,6 +230,20 @@ def _owned_analysis(db: Session, analysis_id: str, owner_id: str) -> Analysis:
     if analysis is None:
         raise HTTPException(404, "Analysis not found.")
     return analysis
+
+
+def _owned_pose_comparison(
+    db: Session, comparison_id: str, owner_id: str
+) -> PoseComparison:
+    """经 Project 关联检查人体参考比较归属。"""
+    comparison = db.scalar(
+        select(PoseComparison)
+        .join(Project, PoseComparison.project_id == Project.id)
+        .where(PoseComparison.id == comparison_id, Project.owner_id == owner_id)
+    )
+    if comparison is None:
+        raise HTTPException(404, "Pose comparison not found.")
+    return comparison
 
 
 def _limit_ai(request: Request) -> None:
@@ -238,6 +281,59 @@ def _project_response(project: Project) -> ProjectCreateResponse:
     )
 
 
+def _pose_comparison_response(
+    comparison: PoseComparison, project: Project
+) -> PoseComparisonResponse:
+    """从 JSON 快照恢复可编辑骨架和确定性比较结果。"""
+    return PoseComparisonResponse(
+        id=comparison.id,
+        project_id=comparison.project_id,
+        artwork_image_url=_media_url(project.image_key),
+        reference_image_url=_media_url(comparison.reference_image_key),
+        reference_filename=comparison.reference_filename,
+        style_mode=comparison.style_mode,
+        status=comparison.status,
+        artwork_skeleton=(
+            PoseSkeleton.model_validate_json(comparison.artwork_skeleton_json)
+            if comparison.artwork_skeleton_json
+            else None
+        ),
+        reference_skeleton=(
+            PoseSkeleton.model_validate_json(comparison.reference_skeleton_json)
+            if comparison.reference_skeleton_json
+            else None
+        ),
+        result=(
+            PoseComparisonResult.model_validate_json(comparison.result_json)
+            if comparison.result_json
+            else None
+        ),
+        created_at=comparison.created_at,
+        updated_at=comparison.updated_at,
+    )
+
+
+def _pose_inspection_response(
+    inspection: PoseInspection, project: Project
+) -> PoseInspectionResponse:
+    """恢复作品骨架和无参考检查快照；结果不经过语言模型改写。"""
+    return PoseInspectionResponse(
+        id=inspection.id,
+        project_id=inspection.project_id,
+        artwork_image_url=_media_url(project.image_key),
+        style_mode=inspection.style_mode,
+        status=inspection.status,
+        skeleton=PoseSkeleton.model_validate_json(inspection.skeleton_json),
+        result=(
+            PoseComparisonResult.model_validate_json(inspection.result_json)
+            if inspection.result_json
+            else None
+        ),
+        created_at=inspection.created_at,
+        updated_at=inspection.updated_at,
+    )
+
+
 # ------------------------- 健康检查、会话与图片资源 -------------------------
 
 @app.get(f"{settings.api_prefix}/health")
@@ -250,6 +346,8 @@ def health() -> dict:
         "openai_configured": bool(settings.openai_api_key),
         "model": settings.active_model,
         "storage": settings.storage_backend,
+        "pose_enabled": settings.pose_feature_enabled,
+        "pose_provider": settings.pose_provider,
     }
 
 
@@ -260,6 +358,8 @@ def session_ready(request: Request) -> dict[str, bool]:
         "ready": True,
         "access_required": bool(settings.demo_access_code),
         "access_granted": bool(request.state.access_granted),
+        # 前端据此隐藏未部署的GPU功能，避免展示一个必定503的入口。
+        "pose_enabled": settings.pose_feature_enabled,
     }
 
 
@@ -281,7 +381,15 @@ def media(
         .join(Project, Revision.project_id == Project.id)
         .where(Revision.image_key == safe_key, Project.owner_id == owner_id)
     )
-    if not owns_original and not owns_revision:
+    owns_pose_reference = db.scalar(
+        select(PoseComparison.id)
+        .join(Project, PoseComparison.project_id == Project.id)
+        .where(
+            PoseComparison.reference_image_key == safe_key,
+            Project.owner_id == owner_id,
+        )
+    )
+    if not owns_original and not owns_revision and not owns_pose_reference:
         raise HTTPException(404, "Image not found.")
     blobs = _storage()
     try:
@@ -552,6 +660,281 @@ def update_annotation(
         result=result,
         created_at=analysis.created_at,
     )
+
+
+# ------------------------- 作品人体结构自检 -------------------------
+
+@app.get(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose-inspection",
+    response_model=PoseInspectionResponse | None,
+)
+def latest_pose_inspection(
+    project_id: str,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseInspectionResponse | None:
+    """恢复作品最近一次骨架自检；尚未估计时返回 null。"""
+    project = _owned_project(db, project_id, owner_id)
+    inspection = db.scalar(
+        select(PoseInspection)
+        .where(PoseInspection.project_id == project.id)
+        .order_by(PoseInspection.created_at.desc())
+        .limit(1)
+    )
+    if inspection is None:
+        return None
+    return _pose_inspection_response(inspection, project)
+
+
+@app.post(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose-inspection/estimate",
+    response_model=PoseInspectionResponse,
+)
+def estimate_pose_inspection(
+    project_id: str,
+    request: PoseInspectionEstimateRequest,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseInspectionResponse:
+    """在用户指定的单人区域运行本地姿态模型，只生成可编辑证据。"""
+    project = _owned_project(db, project_id, owner_id)
+    try:
+        skeleton = _pose_client().estimate(
+            _storage().read(project.image_key), request.bbox
+        )
+    except PoseClientError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    inspection = PoseInspection(
+        project_id=project.id,
+        style_mode=request.style_mode,
+        status="estimated",
+        skeleton_json=skeleton.model_dump_json(),
+    )
+    db.add(inspection)
+    db.commit()
+    db.refresh(inspection)
+    return _pose_inspection_response(inspection, project)
+
+
+@app.put(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose-inspection/skeleton",
+    response_model=PoseInspectionResponse,
+)
+def update_pose_inspection(
+    project_id: str,
+    request: PoseInspectionUpdateRequest,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseInspectionResponse:
+    """保存拖动/显隐修正；改动骨架后旧的结构结论立即失效。"""
+    project = _owned_project(db, project_id, owner_id)
+    inspection = db.scalar(
+        select(PoseInspection)
+        .where(PoseInspection.project_id == project.id)
+        .order_by(PoseInspection.created_at.desc())
+        .limit(1)
+    )
+    if inspection is None:
+        raise HTTPException(409, "Estimate the artwork skeleton first.")
+    inspection.skeleton_json = request.skeleton.model_dump_json()
+    inspection.result_json = None
+    inspection.status = "confirmed" if request.skeleton.confirmed else "estimated"
+    db.commit()
+    db.refresh(inspection)
+    return _pose_inspection_response(inspection, project)
+
+
+@app.post(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose-inspection/check",
+    response_model=PoseInspectionResponse,
+)
+def check_pose_inspection(
+    project_id: str,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseInspectionResponse:
+    """对用户确认的骨架运行保守的2D自洽性规则，并保存数值证据。"""
+    project = _owned_project(db, project_id, owner_id)
+    inspection = db.scalar(
+        select(PoseInspection)
+        .where(PoseInspection.project_id == project.id)
+        .order_by(PoseInspection.created_at.desc())
+        .limit(1)
+    )
+    if inspection is None:
+        raise HTTPException(409, "Estimate the artwork skeleton first.")
+    skeleton = PoseSkeleton.model_validate_json(inspection.skeleton_json)
+    if not skeleton.confirmed:
+        raise HTTPException(409, "Confirm the artwork skeleton before checking.")
+    result = inspect_skeleton(skeleton, inspection.style_mode)
+    inspection.result_json = result.model_dump_json()
+    inspection.status = "checked"
+    db.commit()
+    db.refresh(inspection)
+    return _pose_inspection_response(inspection, project)
+
+
+# ------------------------- 参考图人体结构检查 -------------------------
+
+@app.post(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose-comparisons",
+    response_model=PoseComparisonResponse,
+)
+async def create_pose_comparison(
+    project_id: str,
+    request: Request,
+    reference_image: UploadFile = File(...),
+    style_mode: str = Form("semi_realistic"),
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseComparisonResponse:
+    """保存用户指定的参考图；此时尚不运行模型，也不产生结构结论。"""
+    ai_guard.check_upload(request)
+    project = _owned_project(db, project_id, owner_id)
+    allowed_modes = {
+        "realistic",
+        "semi_realistic",
+        "stylized",
+        "intentional_distortion",
+    }
+    if style_mode not in allowed_modes:
+        raise HTTPException(400, "Unknown pose tolerance mode.")
+    data, suffix = await _read_upload(reference_image)
+    key = _storage().save(data, suffix)
+    comparison = PoseComparison(
+        project_id=project.id,
+        reference_image_key=key,
+        reference_filename=(
+            reference_image.filename or f"reference{suffix}"
+        )[:255],
+        style_mode=style_mode,
+        status="created",
+    )
+    db.add(comparison)
+    db.commit()
+    db.refresh(comparison)
+    return _pose_comparison_response(comparison, project)
+
+
+@app.get(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose-comparisons/latest",
+    response_model=PoseComparisonResponse | None,
+)
+def latest_pose_comparison(
+    project_id: str,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseComparisonResponse | None:
+    """恢复最近一次人体参考检查；尚未创建时返回 null，而不是预期内的 404。"""
+    project = _owned_project(db, project_id, owner_id)
+    comparison = db.scalar(
+        select(PoseComparison)
+        .where(PoseComparison.project_id == project.id)
+        .order_by(PoseComparison.created_at.desc())
+        .limit(1)
+    )
+    if comparison is None:
+        return None
+    return _pose_comparison_response(comparison, project)
+
+
+@app.get(
+    f"{settings.api_prefix}/pose-comparisons/{{comparison_id}}",
+    response_model=PoseComparisonResponse,
+)
+def get_pose_comparison(
+    comparison_id: str,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseComparisonResponse:
+    comparison = _owned_pose_comparison(db, comparison_id, owner_id)
+    project = _owned_project(db, comparison.project_id, owner_id)
+    return _pose_comparison_response(comparison, project)
+
+
+@app.post(
+    f"{settings.api_prefix}/pose-comparisons/{{comparison_id}}/estimate",
+    response_model=PoseComparisonResponse,
+)
+def estimate_pose_comparison(
+    comparison_id: str,
+    request: PoseEstimateRequest,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseComparisonResponse:
+    """对用户框选的两个单人区域运行相同的姿态模型，不在此阶段作判断。"""
+    comparison = _owned_pose_comparison(db, comparison_id, owner_id)
+    project = _owned_project(db, comparison.project_id, owner_id)
+    blobs = _storage()
+    try:
+        artwork = _pose_client().estimate(
+            blobs.read(project.image_key), request.artwork_bbox
+        )
+        reference = _pose_client().estimate(
+            blobs.read(comparison.reference_image_key), request.reference_bbox
+        )
+    except PoseClientError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    comparison.artwork_skeleton_json = artwork.model_dump_json()
+    comparison.reference_skeleton_json = reference.model_dump_json()
+    comparison.result_json = None
+    comparison.status = "estimated"
+    db.commit()
+    db.refresh(comparison)
+    return _pose_comparison_response(comparison, project)
+
+
+@app.put(
+    f"{settings.api_prefix}/pose-comparisons/{{comparison_id}}/skeletons",
+    response_model=PoseComparisonResponse,
+)
+def update_pose_skeletons(
+    comparison_id: str,
+    request: PoseSkeletonUpdateRequest,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseComparisonResponse:
+    """保存关键点拖动和显隐修改；任一方改动都会使旧比较结果失效。"""
+    comparison = _owned_pose_comparison(db, comparison_id, owner_id)
+    project = _owned_project(db, comparison.project_id, owner_id)
+    comparison.artwork_skeleton_json = request.artwork_skeleton.model_dump_json()
+    comparison.reference_skeleton_json = request.reference_skeleton.model_dump_json()
+    comparison.result_json = None
+    comparison.status = (
+        "confirmed"
+        if request.artwork_skeleton.confirmed
+        and request.reference_skeleton.confirmed
+        else "estimated"
+    )
+    db.commit()
+    db.refresh(comparison)
+    return _pose_comparison_response(comparison, project)
+
+
+@app.post(
+    f"{settings.api_prefix}/pose-comparisons/{{comparison_id}}/compare",
+    response_model=PoseComparisonResponse,
+)
+def compare_pose_comparison(
+    comparison_id: str,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> PoseComparisonResponse:
+    """只比较用户确认后的两份骨架，并保存每条数值残差与证据点。"""
+    comparison = _owned_pose_comparison(db, comparison_id, owner_id)
+    project = _owned_project(db, comparison.project_id, owner_id)
+    if not comparison.artwork_skeleton_json or not comparison.reference_skeleton_json:
+        raise HTTPException(409, "Estimate and confirm both skeletons first.")
+    artwork = PoseSkeleton.model_validate_json(comparison.artwork_skeleton_json)
+    reference = PoseSkeleton.model_validate_json(comparison.reference_skeleton_json)
+    if not artwork.confirmed or not reference.confirmed:
+        raise HTTPException(409, "Confirm both skeletons before comparison.")
+    result = compare_skeletons(artwork, reference, comparison.style_mode)
+    comparison.result_json = result.model_dump_json()
+    comparison.status = "compared"
+    db.commit()
+    db.refresh(comparison)
+    return _pose_comparison_response(comparison, project)
 
 
 # ------------------------- 用户反馈与修改版闭环 -------------------------

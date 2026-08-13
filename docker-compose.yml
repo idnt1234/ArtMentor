@@ -51,6 +51,12 @@ services:
       AI_RATE_LIMIT_PER_HOUR: ${AI_RATE_LIMIT_PER_HOUR:-20}
       UPLOAD_RATE_LIMIT_PER_HOUR: ${UPLOAD_RATE_LIMIT_PER_HOUR:-10}
       MAX_CONCURRENT_AI_REQUESTS: ${MAX_CONCURRENT_AI_REQUESTS:-2}
+      # Docker cannot use a Windows host worker at 127.0.0.1. Set this to a
+      # reachable worker URL before enabling body checks in Compose.
+      POSE_FEATURE_ENABLED: ${POSE_FEATURE_ENABLED:-false}
+      POSE_PROVIDER: ${POSE_PROVIDER:-worker}
+      POSE_WORKER_URL: ${POSE_WORKER_URL:-http://host.docker.internal:8011}
+      POSE_WORKER_TOKEN: ${POSE_WORKER_TOKEN:-}
     depends_on:
       db:
         condition: service_healthy

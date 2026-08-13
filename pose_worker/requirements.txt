@@ -1,0 +1,4 @@
+# Install these small HTTP dependencies into the existing D:\ArtMentorPose MMPose env.
+fastapi==0.116.1
+uvicorn[standard]==0.35.0
+pydantic==2.11.7

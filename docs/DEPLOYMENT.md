@@ -35,6 +35,8 @@ Enter these only in Render's Blueprint secret prompts:
 | `S3_SECRET_KEY` | Supabase Storage S3 secret access key |
 | `GPTSAPI_KEY` | WildAI / GPTsAPI key |
 | `DEMO_ACCESS_CODE` | A code shared only with reviewers and testers |
+| `POSE_WORKER_URL` | Private GPU worker HTTPS base address, without `/health` |
+| `POSE_WORKER_TOKEN` | Same private Bearer token stored on the GPU worker |
 
 The checked-in `render.yaml` supplies these non-secret variables:
 
@@ -55,8 +57,29 @@ The checked-in `render.yaml` supplies these non-secret variables:
 | `AI_RATE_LIMIT_PER_HOUR` | `12` |
 | `UPLOAD_RATE_LIMIT_PER_HOUR` | `8` |
 | `MAX_CONCURRENT_AI_REQUESTS` | `1` |
+| `POSE_FEATURE_ENABLED` | Keep `false` until the GPU URL/token are both set and tested |
+| `POSE_PROVIDER` | `worker` |
+| `POSE_WORKER_TIMEOUT_SECONDS` | `45` |
 
 The access code is optional in code, but required by this Blueprint prompt and strongly recommended because every successful critique spends a shared third-party API allowance.
+
+### Enable the separate 2D pose worker
+
+The web image never includes Torch, MMPose or model weights. After the private
+GPU endpoint passes both `/health` and an authenticated real-image smoke test:
+
+1. Enter `POSE_WORKER_URL` and `POSE_WORKER_TOKEN` in the Render service's
+   environment settings. Never prefix these with `VITE_`; they must remain
+   server-only.
+2. Set `POSE_FEATURE_ENABLED=true` and redeploy.
+3. Confirm `/api/session` returns `pose_enabled: true`; the frontend will then
+   reveal the Body structure tab. When the flag is false, the tab stays hidden
+   rather than opening a feature that must fail.
+4. Keep the Render demo protected by `DEMO_ACCESS_CODE` while the GPU endpoint
+   is authorized only for private testing.
+
+Turning the GPU instance off makes new skeleton estimation unavailable. It does
+not affect the normal critique flow or already saved, user-corrected skeletons.
 
 ## 5. Verify the deployed result
 
@@ -67,6 +90,8 @@ After Render reports **Live**:
 3. Import one public-domain sample, run a critique, refresh the page, and confirm it remains in Recent work.
 4. Open a second private browser profile and confirm the first profile's project is not listed and its media URL returns 404.
 5. Upload a revision and confirm the before/after report survives a Render restart.
+6. When pose is enabled, estimate one artwork skeleton, correct a point, save it,
+   run the 2D check, refresh the page, and confirm the corrected skeleton remains.
 
 ## Privacy and operational limits
 

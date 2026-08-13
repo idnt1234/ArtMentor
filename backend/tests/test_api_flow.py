@@ -119,6 +119,156 @@ def test_anonymous_sessions_cannot_read_each_others_projects() -> None:
         assert client.get(project["image_url"]).status_code == 404
 
 
+def test_reference_pose_check_persists_corrected_evidence() -> None:
+    """覆盖参考图、双骨架、人工修正、确定性比较和刷新恢复。"""
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/projects",
+            data={
+                "title": "Pose structure study",
+                "stage": "Structure / anatomy study",
+                "style": "Semi-realistic",
+                "intent": "Compare this figure's pose structure against a trusted reference.",
+            },
+            files={"image": ("artwork.png", artwork_bytes(), "image/png")},
+        )
+        assert created.status_code == 200, created.text
+        project = created.json()
+
+        empty_latest = client.get(
+            f"/api/projects/{project['id']}/pose-comparisons/latest"
+        )
+        assert empty_latest.status_code == 200
+        assert empty_latest.json() is None
+
+        pose = client.post(
+            f"/api/projects/{project['id']}/pose-comparisons",
+            data={"style_mode": "semi_realistic"},
+            files={"reference_image": ("reference.png", artwork_bytes(), "image/png")},
+        )
+        assert pose.status_code == 200, pose.text
+        comparison = pose.json()
+        assert client.get(comparison["reference_image_url"]).status_code == 200
+
+        estimated = client.post(
+            f"/api/pose-comparisons/{comparison['id']}/estimate",
+            json={
+                "artwork_bbox": {"x": 0.05, "y": 0.03, "width": 0.9, "height": 0.94},
+                "reference_bbox": {"x": 0.05, "y": 0.03, "width": 0.9, "height": 0.94},
+            },
+        )
+        assert estimated.status_code == 200, estimated.text
+        payload = estimated.json()
+        assert len(payload["artwork_skeleton"]["keypoints"]) == 17
+        assert payload["status"] == "estimated"
+
+        artwork = payload["artwork_skeleton"]
+        reference = payload["reference_skeleton"]
+        wrist = next(point for point in artwork["keypoints"] if point["name"] == "left_wrist")
+        wrist.update({"x": 0.52, "y": 0.72, "source": "user", "confidence": 1})
+        artwork["confirmed"] = True
+        reference["confirmed"] = True
+        saved = client.put(
+            f"/api/pose-comparisons/{comparison['id']}/skeletons",
+            json={"artwork_skeleton": artwork, "reference_skeleton": reference},
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["status"] == "confirmed"
+
+        compared = client.post(
+            f"/api/pose-comparisons/{comparison['id']}/compare"
+        )
+        assert compared.status_code == 200, compared.text
+        report = compared.json()
+        assert report["status"] == "compared"
+        assert report["result"]["overall_status"] == "suspicious"
+        assert any(
+            "left_wrist" in finding["keypoints"]
+            for finding in report["result"]["findings"]
+        )
+
+        restored = client.get(
+            f"/api/projects/{project['id']}/pose-comparisons/latest"
+        )
+        assert restored.status_code == 200
+        assert restored.json()["result"] == report["result"]
+
+        reference_url = comparison["reference_image_url"]
+        client.cookies.clear()
+        assert client.get(reference_url).status_code == 404
+
+
+def test_artwork_pose_self_check_requires_confirmed_editable_evidence() -> None:
+    """作品主流程可独立估计、修正、确认和恢复骨架检查，无需参考图。"""
+    with TestClient(app) as client:
+        created = client.post(
+            "/api/projects",
+            data={
+                "title": "Artwork body self-check",
+                "stage": "Character design sketch",
+                "style": "Semi-realistic",
+                "intent": "Check the figure structure while preserving the raised-arm pose.",
+            },
+            files={"image": ("figure.png", artwork_bytes(), "image/png")},
+        )
+        assert created.status_code == 200, created.text
+        project = created.json()
+
+        empty = client.get(f"/api/projects/{project['id']}/pose-inspection")
+        assert empty.status_code == 200
+        assert empty.json() is None
+
+        estimated = client.post(
+            f"/api/projects/{project['id']}/pose-inspection/estimate",
+            json={
+                "bbox": {"x": 0.03, "y": 0.02, "width": 0.94, "height": 0.96},
+                "style_mode": "semi_realistic",
+            },
+        )
+        assert estimated.status_code == 200, estimated.text
+        report = estimated.json()
+        assert report["status"] == "estimated"
+        assert len(report["skeleton"]["keypoints"]) == 17
+        assert report["result"] is None
+
+        rejected = client.post(
+            f"/api/projects/{project['id']}/pose-inspection/check"
+        )
+        assert rejected.status_code == 409
+
+        skeleton = report["skeleton"]
+        wrist = next(
+            point for point in skeleton["keypoints"]
+            if point["name"] == "left_wrist"
+        )
+        wrist.update(
+            {"x": 0.95, "y": 0.95, "source": "user", "confidence": 1}
+        )
+        skeleton["confirmed"] = True
+        saved = client.put(
+            f"/api/projects/{project['id']}/pose-inspection/skeleton",
+            json={"skeleton": skeleton},
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["status"] == "confirmed"
+
+        checked = client.post(
+            f"/api/projects/{project['id']}/pose-inspection/check"
+        )
+        assert checked.status_code == 200, checked.text
+        result = checked.json()
+        assert result["status"] == "checked"
+        assert result["result"]["overall_status"] == "suspicious"
+        assert any(
+            "left_wrist" in finding["keypoints"]
+            for finding in result["result"]["findings"]
+        )
+
+        restored = client.get(f"/api/projects/{project['id']}/pose-inspection")
+        assert restored.status_code == 200
+        assert restored.json()["result"] == result["result"]
+
+
 def test_production_frontend_is_served_when_built() -> None:
     """构建产物存在时由 FastAPI 提供 SPA；纯后端 CI 中允许尚未构建。"""
     with TestClient(app) as client:
@@ -145,6 +295,7 @@ def test_optional_access_code_unlocks_api_and_media_cookie() -> None:
             )
             assert unlocked.status_code == 200
             assert unlocked.json()["access_granted"] is True
+            assert unlocked.json()["pose_enabled"] is True
 
             created = client.post(
                 "/api/projects",
@@ -160,3 +311,21 @@ def test_optional_access_code_unlocks_api_and_media_cookie() -> None:
             assert client.get(created.json()["image_url"]).status_code == 200
     finally:
         settings.demo_access_code = None
+
+
+def test_session_exposes_pose_feature_flag_for_safe_frontend_gating() -> None:
+    """未部署GPU Worker时，前端必须能隐藏人体检查入口。"""
+    original = settings.pose_feature_enabled
+    try:
+        with TestClient(app) as client:
+            settings.pose_feature_enabled = False
+            disabled = client.get("/api/session")
+            assert disabled.status_code == 200
+            assert disabled.json()["pose_enabled"] is False
+
+            settings.pose_feature_enabled = True
+            enabled = client.get("/api/session")
+            assert enabled.status_code == 200
+            assert enabled.json()["pose_enabled"] is True
+    finally:
+        settings.pose_feature_enabled = original

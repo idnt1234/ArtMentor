@@ -1,7 +1,8 @@
 """ArtMentor 的 SQLAlchemy 持久化模型。
 
 Project 是一次作品学习的根记录；Analysis 保存某次点评的完整 JSON 快照；
-Feedback 保存用户对单条建议的判断；Revision 保存修改图和 before/after 报告。
+Feedback 保存用户对单条建议的判断；Revision 保存修改图和 before/after 报告；
+PoseInspection 保存作品自身的可编辑骨架和无参考检查；PoseComparison 保存参考图比较。
 MVP 先把复杂且仍会随 Prompt 演进的结果保存为 JSON，避免频繁修改很多关系表。
 """
 
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .database import Base
 
 
-# 数据关系：Project 是根记录；Analysis、Revision 属于 Project，Feedback 属于 Analysis。
+# 数据关系：Project 是根记录；Analysis、Revision、PoseComparison 属于 Project。
 # MVP 将复杂点评保存为 JSON，便于快速迭代 Prompt；结构稳定后可再拆成分析表。
 
 
@@ -45,6 +46,12 @@ class Project(Base):
 
     analyses: Mapped[list["Analysis"]] = relationship(back_populates="project", cascade="all, delete-orphan")
     revisions: Mapped[list["Revision"]] = relationship(back_populates="project", cascade="all, delete-orphan")
+    pose_comparisons: Mapped[list["PoseComparison"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
+    pose_inspections: Mapped[list["PoseInspection"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
     # 删除 Project 时一并删除其点评和修改版，避免留下失去归属的记录。
 
 
@@ -89,3 +96,42 @@ class Revision(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     project: Mapped[Project] = relationship(back_populates="revisions")
+
+
+class PoseComparison(Base):
+    """参考图人体检查的一次完整实验记录，骨架与结果按版本快照保存。"""
+    __tablename__ = "pose_comparisons"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    reference_image_key: Mapped[str] = mapped_column(String(255))
+    reference_filename: Mapped[str] = mapped_column(String(255))
+    style_mode: Mapped[str] = mapped_column(String(40), default="semi_realistic")
+    status: Mapped[str] = mapped_column(String(24), default="created")
+    artwork_skeleton_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reference_skeleton_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    project: Mapped[Project] = relationship(back_populates="pose_comparisons")
+
+
+class PoseInspection(Base):
+    """作品自身的人体骨架草稿、用户修正和无参考自洽性检查快照。"""
+    __tablename__ = "pose_inspections"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    style_mode: Mapped[str] = mapped_column(String(40), default="semi_realistic")
+    status: Mapped[str] = mapped_column(String(24), default="estimated")
+    skeleton_json: Mapped[str] = mapped_column(Text)
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )
+
+    project: Mapped[Project] = relationship(back_populates="pose_inspections")

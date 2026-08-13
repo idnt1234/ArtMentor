@@ -49,3 +49,14 @@ services:
         value: "8"
       - key: MAX_CONCURRENT_AI_REQUESTS
         value: "1"
+      # GPU body checks remain hidden until both private values are configured.
+      - key: POSE_FEATURE_ENABLED
+        value: "false"
+      - key: POSE_PROVIDER
+        value: worker
+      - key: POSE_WORKER_URL
+        sync: false
+      - key: POSE_WORKER_TOKEN
+        sync: false
+      - key: POSE_WORKER_TIMEOUT_SECONDS
+        value: "45"

@@ -23,6 +23,7 @@ import {
   Palette,
   PenLine,
   RotateCcw,
+  ScanLine,
   Sparkles,
   Target,
   ThumbsDown,
@@ -44,9 +45,10 @@ import type {
 
 // 标注画布依赖 Konva，体积较大；只在点评结果出现后再加载，缩短首屏等待时间。
 const AnnotationCanvas = lazy(() => import("./components/AnnotationCanvas"));
+const BodyCheckPanel = lazy(() => import("./components/BodyCheckPanel"));
 
 // 点评完成后的右侧内容页签，以及当前正在执行的互斥异步任务。
-type Tab = "critique" | "references" | "revision";
+type Tab = "critique" | "references" | "pose" | "revision";
 type Busy = "upload" | "intent" | "analysis" | "revision" | null;
 
 const DIMENSION_ICONS = {
@@ -68,6 +70,15 @@ const STAGES = [
   "Rendering",
   "Polishing",
 ];
+const BODY_CHECK_STAGES = new Set([
+  "Gesture sketch",
+  "Structure / anatomy study",
+  "Character design sketch",
+]);
+
+function defaultResultTab(stage: string, poseEnabled: boolean): Tab {
+  return poseEnabled && BODY_CHECK_STAGES.has(stage) ? "pose" : "critique";
+}
 
 function formatDate(value: string) {
   // 历史列表只显示便于扫读的月/日，完整时间仍由后端保存。
@@ -98,6 +109,8 @@ function App() {
   const [accessRequired, setAccessRequired] = useState(false);
   const [accessCode, setAccessCode] = useState("");
   const [accessBusy, setAccessBusy] = useState(false);
+  // 后端部署开关决定是否展示GPU人体功能；未配置Worker时不显示失效入口。
+  const [poseEnabled, setPoseEnabled] = useState(false);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [form, setForm] = useState({
@@ -113,6 +126,7 @@ function App() {
     // 启动时先检查访问权限，通过后再并行加载样例与当前浏览器的历史项目。
     const bootstrap = async () => {
       const session = await api.session();
+      setPoseEnabled(session.pose_enabled);
       if (session.access_required && !session.access_granted) {
         setAccessRequired(true);
         return;
@@ -140,6 +154,7 @@ function App() {
     try {
       setDemoAccessCode(accessCode);
       const session = await api.session();
+      setPoseEnabled(session.pose_enabled);
       if (!session.access_granted) throw new Error("That access code is not correct.");
       const [sampleData, projects] = await Promise.all([api.samples(), api.projects()]);
       setSamples(sampleData);
@@ -191,9 +206,11 @@ function App() {
       if (item.latest_analysis_id) {
         const loaded = await api.analysis(item.latest_analysis_id);
         setAnalysis(loaded);
-        setConfirmedStage(loaded.result.confirmed_stage || item.stage);
+        const restoredStage = loaded.result.confirmed_stage || item.stage;
+        setConfirmedStage(restoredStage);
         setConfirmedAction(loaded.result.confirmed_action || "");
         setActiveSuggestion(loaded.result.suggestions[0]?.id ?? null);
+        setTab(defaultResultTab(restoredStage, poseEnabled));
       } else {
         setAnalysis(null);
         const restated = await api.restateIntent(item.id);
@@ -261,6 +278,7 @@ function App() {
       setAnalysis(result);
       setIntentDraft(null);
       setActiveSuggestion(result.result.suggestions[0]?.id ?? null);
+      setTab(defaultResultTab(confirmedStage, poseEnabled));
       await refreshHistory();
     } catch (cause) {
       setError((cause as Error).message);
@@ -404,8 +422,8 @@ function App() {
         {project && !intentDraft && busy === "analysis" && !analysis && <LoadingAnalysis />}
 
         {project && analysis && (
-          <div className="analysis-layout">
-            <section className="artwork-column">
+          <div className={`analysis-layout ${tab === "pose" ? "pose-active" : ""}`}>
+            {tab !== "pose" && <section className="artwork-column">
               <Suspense fallback={<div className="canvas-loading"><LoaderCircle className="spin" size={25} /> Preparing canvas…</div>}>
                 <AnnotationCanvas
                   imageUrl={assetUrl(project.image_url)}
@@ -420,16 +438,19 @@ function App() {
                 <div>{analysis.result.visual_metrics.palette.map((color) => <i key={color} style={{ background: color }} title={color} />)}</div>
                 <small>{analysis.result.visual_metrics.width} × {analysis.result.visual_metrics.height}</small>
               </div>
-            </section>
+            </section>}
 
             <aside className="inspector">
               <div className="tabs">
                 <button className={tab === "critique" ? "active" : ""} onClick={() => setTab("critique")}>Critique</button>
                 <button className={tab === "references" ? "active" : ""} onClick={() => setTab("references")}>References</button>
+                {poseEnabled && (
+                  <button className={tab === "pose" ? "active" : ""} onClick={() => setTab("pose")}><ScanLine size={13} /> Body structure</button>
+                )}
                 <button className={tab === "revision" ? "active" : ""} onClick={() => setTab("revision")}>Revision</button>
               </div>
 
-              {analysis.result.warning && <div className="demo-notice"><Sparkles size={15} />{analysis.result.warning}</div>}
+              {tab === "critique" && analysis.result.warning && <div className="demo-notice"><Sparkles size={15} />{analysis.result.warning}</div>}
 
               {tab === "critique" && (
                 <CritiquePanel
@@ -448,6 +469,13 @@ function App() {
                 <div className="panel-scroll">
                   <div className="section-intro"><p className="eyebrow">Public-domain study set</p><h2>Look with a purpose.</h2><p>Each work is paired to a specific decision in your critique. Open the museum record for provenance.</p></div>
                   <ReferenceGrid references={analysis.result.references} />
+                </div>
+              )}
+              {poseEnabled && tab === "pose" && (
+                <div className="panel-scroll pose-scroll">
+                  <Suspense fallback={<div className="pose-loading"><LoaderCircle className="spin" size={22} /> Loading body-check workspace…</div>}>
+                    <BodyCheckPanel project={project} onError={setError} />
+                  </Suspense>
                 </div>
               )}
               {tab === "revision" && (

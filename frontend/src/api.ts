@@ -4,7 +4,18 @@
  * 页面组件只调用下方 api 对象；本文件集中处理部署地址、Demo 访问码、
  * 匿名会话 Cookie、JSON 序列化和统一错误信息，避免这些细节散落在 UI 中。
  */
-import type { Analysis, IntentRestatement, Project, Rect, Revision, SampleArtwork } from "./types";
+import type {
+  Analysis,
+  IntentRestatement,
+  PoseComparison,
+  PoseInspection,
+  PoseSkeleton,
+  PoseStyleMode,
+  Project,
+  Rect,
+  Revision,
+  SampleArtwork,
+} from "./types";
 
 // 生产环境前后端同域使用 /api；本地也可通过 Vite 环境变量连接独立后端。
 const API_ROOT = import.meta.env.VITE_API_URL ?? "/api";
@@ -50,7 +61,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 // 页面组件只依赖这个对象，不直接关心 URL、Header、Cookie 和错误解析细节。
 export const api = {
   // 启动与历史：判断门禁状态，读取样例和当前匿名会话的项目。
-  session: () => request<{ ready: boolean; access_required: boolean; access_granted: boolean }>("/session"),
+  session: () => request<{
+    ready: boolean;
+    access_required: boolean;
+    access_granted: boolean;
+    pose_enabled: boolean;
+  }>("/session"),
   samples: () => request<SampleArtwork[]>("/samples"),
   projects: () => request<Project[]>("/projects"),
   // 项目与意图：先保存作品，再单独复述意图，尚未执行正式视觉点评。
@@ -89,4 +105,58 @@ export const api = {
     form.append("image", file);
     return request<Revision>(`/projects/${projectId}/revisions`, { method: "POST", body: form });
   },
+  // 作品人体自检：本地估计单幅作品骨架，用户确认后才运行保守的2D自洽性检查。
+  poseInspection: (projectId: string) =>
+    request<PoseInspection | null>(`/projects/${projectId}/pose-inspection`),
+  estimatePoseInspection: (projectId: string, bbox: Rect, styleMode: PoseStyleMode) =>
+    request<PoseInspection>(`/projects/${projectId}/pose-inspection/estimate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bbox, style_mode: styleMode }),
+    }),
+  updatePoseInspection: (projectId: string, skeleton: PoseSkeleton) =>
+    request<PoseInspection>(`/projects/${projectId}/pose-inspection/skeleton`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ skeleton }),
+    }),
+  checkPoseInspection: (projectId: string) =>
+    request<PoseInspection>(`/projects/${projectId}/pose-inspection/check`, {
+      method: "POST",
+    }),
+  // 参考人体检查：参考图入库 → 双侧骨架估计 → 用户修正确认 → 确定性比较。
+  createPoseComparison: (projectId: string, reference: File, styleMode: PoseStyleMode) => {
+    const form = new FormData();
+    form.append("reference_image", reference);
+    form.append("style_mode", styleMode);
+    return request<PoseComparison>(`/projects/${projectId}/pose-comparisons`, {
+      method: "POST",
+      body: form,
+    });
+  },
+  latestPoseComparison: (projectId: string) =>
+    request<PoseComparison | null>(`/projects/${projectId}/pose-comparisons/latest`),
+  estimatePose: (comparisonId: string, artworkBbox: Rect, referenceBbox: Rect) =>
+    request<PoseComparison>(`/pose-comparisons/${comparisonId}/estimate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ artwork_bbox: artworkBbox, reference_bbox: referenceBbox }),
+    }),
+  updatePoseSkeletons: (
+    comparisonId: string,
+    artworkSkeleton: PoseSkeleton,
+    referenceSkeleton: PoseSkeleton,
+  ) =>
+    request<PoseComparison>(`/pose-comparisons/${comparisonId}/skeletons`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        artwork_skeleton: artworkSkeleton,
+        reference_skeleton: referenceSkeleton,
+      }),
+    }),
+  comparePose: (comparisonId: string) =>
+    request<PoseComparison>(`/pose-comparisons/${comparisonId}/compare`, {
+      method: "POST",
+    }),
 };

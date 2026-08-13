@@ -40,6 +40,12 @@ class Settings(BaseSettings):
     ai_rate_limit_per_hour: int = 20
     upload_rate_limit_per_hour: int = 10
     max_concurrent_ai_requests: int = 2
+    # 人体检查使用独立进程，避免 MMPose/Torch 与 Web 进程的 NumPy 版本冲突。
+    pose_feature_enabled: bool = False
+    pose_provider: Literal["worker", "demo"] = "worker"
+    pose_worker_url: str = "http://127.0.0.1:8011"
+    pose_worker_token: str | None = None
+    pose_worker_timeout_seconds: float = 45.0
 
     model_config = SettingsConfigDict(
         env_file=("../.env", ".env"), env_file_encoding="utf-8", extra="ignore"

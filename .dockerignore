@@ -13,3 +13,11 @@ work
 work-*
 *.sqlite3
 *.log
+# The Render image only needs frontend/ and backend/. Keep research tools and
+# GPU assets out of the web-service build context; the pose worker is deployed
+# separately on a GPU host.
+pose_experiments
+pose_worker
+stage1_annotator
+PROJECT_STATUS.md
+*.docx

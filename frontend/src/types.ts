@@ -147,3 +147,70 @@ export interface Revision {
   comparison: ComparisonResult;
   created_at: string;
 }
+
+export type PoseStyleMode = "realistic" | "semi_realistic" | "stylized" | "intentional_distortion";
+export type PoseStatus = "created" | "estimated" | "confirmed" | "compared";
+
+export interface PoseKeypoint {
+  name: string;
+  x: number;
+  y: number;
+  confidence: number;
+  source: "model" | "user";
+  visibility: "predicted" | "visible" | "hidden" | "unknown";
+}
+
+export interface PoseSkeleton {
+  bbox: Rect;
+  keypoints: PoseKeypoint[];
+  confirmed: boolean;
+  warnings: string[];
+  model: string;
+}
+
+export interface PoseFinding {
+  status: "consistent" | "suspicious" | "insufficient";
+  category: "position" | "proportion" | "angle" | "alignment" | "evidence";
+  title: string;
+  observation: string;
+  reference: string;
+  difference: string;
+  keypoints: string[];
+  confidence: number;
+  suggestion: string;
+}
+
+export interface PoseCheckResult {
+  overall_status: "consistent" | "suspicious" | "insufficient";
+  assumptions: string[];
+  findings: PoseFinding[];
+  comparable_keypoint_count: number;
+  tolerance_mode: PoseStyleMode;
+}
+
+export interface PoseComparison {
+  id: string;
+  project_id: string;
+  artwork_image_url: string;
+  reference_image_url: string;
+  reference_filename: string;
+  style_mode: PoseStyleMode;
+  status: PoseStatus;
+  artwork_skeleton?: PoseSkeleton | null;
+  reference_skeleton?: PoseSkeleton | null;
+  result?: PoseCheckResult | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PoseInspection {
+  id: string;
+  project_id: string;
+  artwork_image_url: string;
+  style_mode: PoseStyleMode;
+  status: "estimated" | "confirmed" | "checked";
+  skeleton: PoseSkeleton;
+  result?: PoseCheckResult | null;
+  created_at: string;
+  updated_at: string;
+}
