@@ -22,6 +22,10 @@ export function configureAuth(url: string, publishableKey: string): void {
       persistSession: true,
       autoRefreshToken: true,
       detectSessionInUrl: true,
+      // Pass the browser store explicitly. In some extension-controlled browser
+      // contexts Supabase's environment probe falls back to its in-memory
+      // adapter, which makes a valid password session disappear on reload.
+      storage: window.localStorage,
       storageKey: "artmentor-account",
     },
   });
