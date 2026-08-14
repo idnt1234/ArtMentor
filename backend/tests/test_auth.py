@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import hmac
+import time
 
 import httpx
 import pytest
@@ -67,7 +70,21 @@ def test_supabase_verifier_fails_closed_for_rejection_or_invalid_identity() -> N
 
 def test_account_bridge_cookie_rejects_tampering() -> None:
     user_id = "11111111-1111-4111-8111-111111111111"
-    cookie = signed_account_cookie(user_id, "test-secret", 60)
-    assert valid_account_cookie(cookie, "test-secret") == user_id
+    cookie = signed_account_cookie(user_id, "test-secret", 60, "artist@example.com")
+    parsed = valid_account_cookie(cookie, "test-secret")
+    assert parsed is not None
+    assert parsed.user_id == user_id
+    assert parsed.email == "artist@example.com"
     assert valid_account_cookie(f"{cookie[:-1]}0", "test-secret") is None
     assert valid_account_cookie(cookie, "different-secret") is None
+
+
+def test_account_bridge_cookie_accepts_first_release_format() -> None:
+    user_id = "11111111-1111-4111-8111-111111111111"
+    expires_at = int(time.time()) + 60
+    payload = f"{user_id}.{expires_at}"
+    signature = hmac.new(b"test-secret", payload.encode(), hashlib.sha256).hexdigest()
+    parsed = valid_account_cookie(f"{payload}.{signature}", "test-secret")
+    assert parsed is not None
+    assert parsed.user_id == user_id
+    assert parsed.email is None

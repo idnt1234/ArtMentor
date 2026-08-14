@@ -152,11 +152,14 @@ function App() {
           // 第二次会话请求携带已恢复的 Bearer Token，并在后端认领匿名作品。
           session = await api.session();
         } else if (session.auth_user_id) {
-          // Supabase 已无本地会话时，不保留孤立的后端桥接 Cookie。
-          await api.logoutBridge();
-          session = await api.session();
+          // 部分浏览器会阻止 Supabase 恢复本地存储；此时继续使用后端已签名、
+          // 有限时效的 HttpOnly 会话，而不是在刷新时把有效登录主动清除。
         }
-        setAccountEmail(account.user?.email ?? session.auth_email);
+        setAccountEmail(
+          account.user?.email
+          ?? session.auth_email
+          ?? (session.auth_user_id ? "ArtMentor account" : null),
+        );
         if (account.session && new URLSearchParams(window.location.search).get("auth") === "recovery") {
           setAuthMode("reset");
           setAuthOpen(true);

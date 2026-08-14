@@ -135,9 +135,11 @@ async def anonymous_session(request: Request, call_next):
     is_new = token is None
     token = token or str(uuid.uuid4())
     anonymous_owner_id = owner_hash(token, settings.session_secret)
-    account_user_id = valid_account_cookie(
+    account_cookie = valid_account_cookie(
         request.cookies.get(ACCOUNT_COOKIE), settings.session_secret
     )
+    account_user_id = account_cookie.user_id if account_cookie else None
+    account_email = account_cookie.email if account_cookie else None
     bearer_user = None
     authorization = request.headers.get("authorization", "").strip()
     if request.url.path == f"{settings.api_prefix}/auth/logout":
@@ -162,7 +164,7 @@ async def anonymous_session(request: Request, call_next):
 
     request.state.anonymous_owner_id = anonymous_owner_id
     request.state.auth_user_id = account_user_id
-    request.state.auth_email = bearer_user.email if bearer_user else None
+    request.state.auth_email = bearer_user.email if bearer_user else account_email
     request.state.owner_id = (
         account_owner_id(account_user_id) if account_user_id else anonymous_owner_id
     )
@@ -228,6 +230,7 @@ async def anonymous_session(request: Request, call_next):
                 bearer_user.id,
                 settings.session_secret,
                 settings.account_cookie_max_age,
+                bearer_user.email,
             ),
             max_age=settings.account_cookie_max_age,
             httponly=True,

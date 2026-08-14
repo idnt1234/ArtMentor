@@ -384,8 +384,12 @@ def test_account_login_claims_anonymous_projects_and_preserves_media_privacy() -
                 assert claimed.json()["auth_email"] == "artist-a@example.com"
                 assert claimed.json()["claimed_projects"] == 1
 
-                # Subsequent img/navigation requests have no Bearer header; the short-lived,
-                # signed HttpOnly bridge cookie must still authorize account-owned media.
+                # A page reload and img/navigation requests have no Bearer header; the
+                # signed HttpOnly bridge must restore identity, email, history, and media.
+                reloaded = client.get("/api/session")
+                assert reloaded.status_code == 200
+                assert reloaded.json()["auth_user_id"] == FakeAuthVerifier.users["account-a"].id
+                assert reloaded.json()["auth_email"] == "artist-a@example.com"
                 assert project["id"] in {
                     item["id"] for item in client.get("/api/projects").json()
                 }

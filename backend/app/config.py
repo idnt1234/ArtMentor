@@ -40,7 +40,9 @@ class Settings(BaseSettings):
     # for the browser; service-role and JWT signing secrets are never accepted here.
     supabase_url: str | None = None
     supabase_publishable_key: str | None = None
-    account_cookie_max_age: int = 60 * 60
+    # Supabase remains the source of truth; this signed HttpOnly bridge keeps a
+    # verified browser session usable when client-side storage is unavailable.
+    account_cookie_max_age: int = 60 * 60 * 24 * 7
     demo_access_code: str | None = None
     ai_rate_limit_per_hour: int = 20
     upload_rate_limit_per_hour: int = 10

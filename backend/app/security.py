@@ -1,3 +1,6 @@
+import base64
+import binascii
+from dataclasses import dataclass
 import hashlib
 import hmac
 import threading
@@ -14,6 +17,12 @@ from .config import Settings
 
 SESSION_COOKIE = "artmentor_session"
 ACCOUNT_COOKIE = "artmentor_account"
+
+
+@dataclass(frozen=True)
+class AccountCookie:
+    user_id: str
+    email: str | None = None
 
 
 def valid_session_token(value: str | None) -> str | None:
@@ -35,30 +44,55 @@ def account_owner_id(user_id: str) -> str:
     return f"auth:{uuid.UUID(user_id)}"
 
 
-def signed_account_cookie(user_id: str, secret: str, max_age: int) -> str:
-    """签发短期账户桥接 Cookie，供不能添加 Authorization 的图片请求使用。"""
+def signed_account_cookie(
+    user_id: str,
+    secret: str,
+    max_age: int,
+    email: str | None = None,
+) -> str:
+    """签发账户桥接 Cookie，供刷新后的页面和私有媒体继续鉴权。"""
     normalized = str(uuid.UUID(user_id))
     expires_at = int(time.time()) + max(1, max_age)
-    payload = f"{normalized}.{expires_at}"
+    encoded_email = (
+        base64.urlsafe_b64encode(email.encode("utf-8")).decode("ascii").rstrip("=")
+        if email
+        else ""
+    )
+    payload = f"{normalized}.{expires_at}.{encoded_email}"
     signature = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}.{signature}"
 
 
-def valid_account_cookie(value: str | None, secret: str) -> str | None:
-    """验证账户桥接 Cookie 的签名和时效，只返回规范化用户 UUID。"""
+def valid_account_cookie(value: str | None, secret: str) -> AccountCookie | None:
+    """验证账户桥接 Cookie 的签名和时效，返回可信账户资料。"""
     if not value:
         return None
     try:
-        user_id, expires_raw, signature = value.split(".", 2)
+        parts = value.split(".")
+        if len(parts) == 3:
+            # Accept the first-release cookie until its one-hour lifetime ends.
+            user_id, expires_raw, signature = parts
+            encoded_email = ""
+            payload = f"{user_id}.{expires_raw}"
+        elif len(parts) == 4:
+            user_id, expires_raw, encoded_email, signature = parts
+            payload = f"{user_id}.{expires_raw}.{encoded_email}"
+        else:
+            return None
         normalized = str(uuid.UUID(user_id))
         expires_at = int(expires_raw)
-    except (ValueError, TypeError):
+        email = None
+        if encoded_email:
+            padding = "=" * (-len(encoded_email) % 4)
+            email = base64.urlsafe_b64decode(encoded_email + padding).decode("utf-8")
+            if len(email) > 320:
+                return None
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error):
         return None
-    payload = f"{normalized}.{expires_at}"
     expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(signature, expected) or expires_at < int(time.time()):
         return None
-    return normalized
+    return AccountCookie(user_id=normalized, email=email)
 
 
 def request_owner(request: Request) -> str:
