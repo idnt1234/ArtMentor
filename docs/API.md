@@ -5,7 +5,8 @@ Interactive OpenAPI documentation is exposed at `/docs` by FastAPI.
 | Method | Endpoint | Purpose |
 |---|---|---|
 | `GET` | `/api/health` | Service, model, and storage status without exposing secrets |
-| `GET` | `/api/session` | Establish the anonymous browser session and report access-gate state |
+| `GET` | `/api/session` | Establish identity, expose public Auth configuration, and claim browser projects after verified login |
+| `POST` | `/api/auth/logout` | Clear the short-lived FastAPI account bridge cookie |
 | `GET` | `/api/samples` | Public-domain sample catalog |
 | `GET` | `/api/media/{key}` | Read an image only when it belongs to the current browser session |
 | `POST` | `/api/samples/{id}/import` | Download a sample into a local project |
@@ -30,7 +31,22 @@ Interactive OpenAPI documentation is exposed at `/docs` by FastAPI.
 
 All AI outputs are validated by Pydantic before persistence. Uploads accept JPG, PNG, or WebP, default to 15 MB maximum, and reject images above 30 megapixels.
 
-Every browser receives an HttpOnly anonymous session cookie. Project, analysis, feedback, revision, and media routes enforce that ownership boundary. When `DEMO_ACCESS_CODE` is configured, protected routes first require `X-ArtMentor-Access-Code`; a successful check creates a one-day HttpOnly access cookie so normal image elements remain authorized. AI and upload endpoints also apply per-IP in-memory limits.
+Every browser receives an HttpOnly anonymous session cookie. Project, analysis,
+feedback, revision, and media routes enforce that ownership boundary. When
+Supabase Auth is configured, the frontend sends its access token only to the
+session exchange endpoint; FastAPI validates it with Supabase Auth before
+changing the request owner. The first verified session atomically transfers
+projects owned by that browser's anonymous ID to the authenticated user. A
+short-lived signed HttpOnly account
+cookie lets normal image elements use the same owner boundary without exposing
+the access token in image URLs. Logout clears that bridge before the browser
+ends its Supabase session.
+
+When `DEMO_ACCESS_CODE` is configured, protected routes first require
+`X-ArtMentor-Access-Code`; a successful check creates a one-day HttpOnly access
+cookie so normal image elements remain authorized. The access code controls the
+shared budget and is independent of personal account authentication. AI and
+upload endpoints also apply per-IP in-memory limits.
 
 `GET /api/health` returns the selected provider, whether that provider is configured, its model ID, and the configured pose-provider mode. It never returns a key or the configured Base URL.
 

@@ -6,6 +6,8 @@ ArtMentor is a modular monolith: one React client and one FastAPI application, w
 flowchart LR
     U["Illustrator"] --> F["React + Konva UI"]
     F --> A["FastAPI workflow API"]
+    F --> AU["Supabase Auth"]
+    A --> AU
     A --> I["Image validation + OpenCV metrics"]
     A --> P["AI provider adapter"]
     P --> G["WildAI / GPTsAPI Chat Completions"]
@@ -65,6 +67,9 @@ flowchart LR
 ## Public-demo boundary
 
 - An anonymous HttpOnly cookie is hashed into an owner ID; every private database lookup includes that owner ID.
+- Email/password accounts are optional. The browser manages Supabase's refreshable session, while FastAPI independently verifies access tokens before trusting the user UUID.
+- A verified login atomically claims only the projects belonging to the current anonymous cookie. Already-account-owned records cannot be claimed by another login.
+- A short-lived HMAC-signed HttpOnly bridge cookie authorizes private image elements, which cannot attach a Bearer header. Supabase passwords and refresh tokens never reach FastAPI.
 - Uploaded media is served through an ownership-checked API route rather than a public bucket URL.
 - An optional access code protects the shared AI budget without putting a secret in the frontend bundle.
 - Per-IP upload and AI-call limits plus a small concurrency semaphore reduce accidental overload on free hosting.
@@ -86,5 +91,5 @@ The multimodal model is good at semantic reading and art-language explanation bu
 - Move long model calls to Celery/Redis without changing response schemas.
 - Replace the curated catalog with museum API ingestion plus embedding retrieval.
 - Add SAM/Grounding DINO only when more exact object masks are justified by evals.
-- Replace anonymous sessions with account authentication and self-service deletion when the project needs long-term user accounts.
+- Add self-service export/deletion and optional OAuth identities after the email/password account flow is validated.
 - Version prompts and run an evaluation set before model or prompt changes.

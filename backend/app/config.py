@@ -36,6 +36,11 @@ class Settings(BaseSettings):
     analysis_max_side: int = 1600
     session_secret: str = "artmentor-local-session-secret"
     session_cookie_secure: bool = False
+    # Supabase Auth is optional locally. The publishable key is intentionally safe
+    # for the browser; service-role and JWT signing secrets are never accepted here.
+    supabase_url: str | None = None
+    supabase_publishable_key: str | None = None
+    account_cookie_max_age: int = 60 * 60
     demo_access_code: str | None = None
     ai_rate_limit_per_hour: int = 20
     upload_rate_limit_per_hour: int = 10
@@ -74,6 +79,10 @@ class Settings(BaseSettings):
         if self.ai_provider == "openai":
             return bool(self.openai_api_key)
         return True
+
+    @property
+    def auth_configured(self) -> bool:
+        return bool(self.supabase_url and self.supabase_publishable_key)
 
     @property
     def resolved_s3_endpoint(self) -> str:

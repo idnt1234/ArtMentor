@@ -13,6 +13,7 @@ from .config import Settings
 
 
 SESSION_COOKIE = "artmentor_session"
+ACCOUNT_COOKIE = "artmentor_account"
 
 
 def valid_session_token(value: str | None) -> str | None:
@@ -27,6 +28,37 @@ def valid_session_token(value: str | None) -> str | None:
 def owner_hash(token: str, secret: str) -> str:
     # 数据库只保存不可逆摘要，不保存浏览器 Cookie 本身。
     return hmac.new(secret.encode(), token.encode(), hashlib.sha256).hexdigest()
+
+
+def account_owner_id(user_id: str) -> str:
+    """把 Supabase 用户 UUID 放入现有 owner_id 命名空间，避免与匿名摘要混淆。"""
+    return f"auth:{uuid.UUID(user_id)}"
+
+
+def signed_account_cookie(user_id: str, secret: str, max_age: int) -> str:
+    """签发短期账户桥接 Cookie，供不能添加 Authorization 的图片请求使用。"""
+    normalized = str(uuid.UUID(user_id))
+    expires_at = int(time.time()) + max(1, max_age)
+    payload = f"{normalized}.{expires_at}"
+    signature = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}.{signature}"
+
+
+def valid_account_cookie(value: str | None, secret: str) -> str | None:
+    """验证账户桥接 Cookie 的签名和时效，只返回规范化用户 UUID。"""
+    if not value:
+        return None
+    try:
+        user_id, expires_raw, signature = value.split(".", 2)
+        normalized = str(uuid.UUID(user_id))
+        expires_at = int(expires_raw)
+    except (ValueError, TypeError):
+        return None
+    payload = f"{normalized}.{expires_at}"
+    expected = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected) or expires_at < int(time.time()):
+        return None
+    return normalized
 
 
 def request_owner(request: Request) -> str:

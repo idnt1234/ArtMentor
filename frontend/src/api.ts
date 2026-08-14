@@ -16,6 +16,7 @@ import type {
   Revision,
   SampleArtwork,
 } from "./types";
+import { authAccessToken } from "./auth";
 
 // 生产环境前后端同域使用 /api；本地也可通过 Vite 环境变量连接独立后端。
 const API_ROOT = import.meta.env.VITE_API_URL ?? "/api";
@@ -39,6 +40,12 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const accessCode = sessionStorage.getItem(ACCESS_CODE_KEY);
   if (accessCode) headers.set("X-ArtMentor-Access-Code", accessCode);
+  // Only the account-exchange endpoint sends the Supabase token. FastAPI then
+  // issues a short-lived HttpOnly bridge, avoiding a remote Auth lookup on every API call.
+  if (path === "/session") {
+    const accessToken = await authAccessToken();
+    if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  }
   // credentials: include 让匿名会话 Cookie 随请求发送，后端据此隔离不同访客。
   const response = await fetch(`${API_ROOT}${path}`, {
     credentials: "include",
@@ -55,18 +62,28 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     }
     throw new Error(message);
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
+}
+
+export interface SessionStatus {
+  ready: boolean;
+  access_required: boolean;
+  access_granted: boolean;
+  pose_enabled: boolean;
+  auth_enabled: boolean;
+  auth_user_id: string | null;
+  auth_email: string | null;
+  supabase_url: string | null;
+  supabase_publishable_key: string | null;
+  claimed_projects: number;
 }
 
 // 页面组件只依赖这个对象，不直接关心 URL、Header、Cookie 和错误解析细节。
 export const api = {
   // 启动与历史：判断门禁状态，读取样例和当前匿名会话的项目。
-  session: () => request<{
-    ready: boolean;
-    access_required: boolean;
-    access_granted: boolean;
-    pose_enabled: boolean;
-  }>("/session"),
+  session: () => request<SessionStatus>("/session"),
+  logoutBridge: () => request<void>("/auth/logout", { method: "POST" }),
   samples: () => request<SampleArtwork[]>("/samples"),
   projects: () => request<Project[]>("/projects"),
   // 项目与意图：先保存作品，再单独复述意图，尚未执行正式视觉点评。

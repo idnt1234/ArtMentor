@@ -17,6 +17,7 @@ import {
   Layers3,
   Lightbulb,
   LoaderCircle,
+  LogIn,
   LockKeyhole,
   Menu,
   MessageSquareMore,
@@ -29,9 +30,17 @@ import {
   ThumbsDown,
   ThumbsUp,
   Upload,
+  UserRound,
   X,
 } from "lucide-react";
 import { api, assetUrl, setDemoAccessCode } from "./api";
+import {
+  configureAuth,
+  currentAuth,
+  listenForAuthChanges,
+  signOutAccount,
+} from "./auth";
+import AuthDialog, { type AuthMode } from "./components/AuthDialog";
 import ReferenceGrid from "./components/ReferenceGrid";
 import RevisionCompare from "./components/RevisionCompare";
 import type {
@@ -111,6 +120,12 @@ function App() {
   const [accessBusy, setAccessBusy] = useState(false);
   // 后端部署开关决定是否展示GPU人体功能；未配置Worker时不显示失效入口。
   const [poseEnabled, setPoseEnabled] = useState(false);
+  // Supabase 负责可恢复账户；未登录时继续沿用原来的匿名浏览器工作区。
+  const [authEnabled, setAuthEnabled] = useState(false);
+  const [accountEmail, setAccountEmail] = useState<string | null>(null);
+  const [authOpen, setAuthOpen] = useState(false);
+  const [authMode, setAuthMode] = useState<AuthMode>("signin");
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
 
   const [form, setForm] = useState({
@@ -123,10 +138,46 @@ function App() {
   const previewUrl = useMemo(() => (uploadFile ? URL.createObjectURL(uploadFile) : null), [uploadFile]);
 
   useEffect(() => {
-    // 启动时先检查访问权限，通过后再并行加载样例与当前浏览器的历史项目。
+    // 启动时读取公开运行时配置，再恢复 Supabase 会话并认领当前匿名作品。
+    let disposed = false;
+    let stopListening: (() => void) | undefined;
     const bootstrap = async () => {
-      const session = await api.session();
+      let session = await api.session();
       setPoseEnabled(session.pose_enabled);
+      setAuthEnabled(session.auth_enabled);
+      if (session.auth_enabled && session.supabase_url && session.supabase_publishable_key) {
+        configureAuth(session.supabase_url, session.supabase_publishable_key);
+        const account = await currentAuth();
+        if (account.session) {
+          // 第二次会话请求携带已恢复的 Bearer Token，并在后端认领匿名作品。
+          session = await api.session();
+        } else if (session.auth_user_id) {
+          // Supabase 已无本地会话时，不保留孤立的后端桥接 Cookie。
+          await api.logoutBridge();
+          session = await api.session();
+        }
+        setAccountEmail(account.user?.email ?? session.auth_email);
+        if (account.session && new URLSearchParams(window.location.search).get("auth") === "recovery") {
+          setAuthMode("reset");
+          setAuthOpen(true);
+        }
+        if (session.claimed_projects > 0) {
+          setAuthNotice(`${session.claimed_projects} browser ${session.claimed_projects === 1 ? "project is" : "projects are"} now saved to your account.`);
+        }
+        stopListening = listenForAuthChanges((event) => {
+          if (event === "PASSWORD_RECOVERY") {
+            setAuthMode("reset");
+            setAuthOpen(true);
+          }
+          if (["SIGNED_IN", "SIGNED_OUT", "TOKEN_REFRESHED", "USER_UPDATED"].includes(event)) {
+            // Supabase warns against awaiting other auth calls inside this callback.
+            window.setTimeout(() => {
+              if (disposed) return;
+              void synchronizeAccount().catch((cause: Error) => setError(cause.message));
+            }, 0);
+          }
+        });
+      }
       if (session.access_required && !session.access_granted) {
         setAccessRequired(true);
         return;
@@ -136,6 +187,10 @@ function App() {
       setHistory(projects);
     };
     bootstrap().catch((cause: Error) => setError(cause.message));
+    return () => {
+      disposed = true;
+      stopListening?.();
+    };
   }, []);
 
   useEffect(() => () => {
@@ -145,6 +200,18 @@ function App() {
 
   // 每次产生新项目或新点评后重新读取历史，确保侧栏与数据库一致。
   const refreshHistory = async () => setHistory(await api.projects());
+
+  const synchronizeAccount = async () => {
+    const account = await currentAuth();
+    const session = await api.session();
+    setAccountEmail(account.user?.email ?? session.auth_email);
+    if (session.claimed_projects > 0) {
+      setAuthNotice(`${session.claimed_projects} browser ${session.claimed_projects === 1 ? "project is" : "projects are"} now saved to your account.`);
+    }
+    if (!session.access_required || session.access_granted) {
+      setHistory(await api.projects());
+    }
+  };
 
   const unlockDemo = async () => {
     // 访问码验证成功后，后端还会写入 HttpOnly Cookie，供后续图片请求使用。
@@ -181,6 +248,21 @@ function App() {
     setActiveSuggestion(null);
     setTab("critique");
     setError(null);
+  };
+
+  const openAccount = () => {
+    setAuthMode(accountEmail ? "account" : "signin");
+    setAuthOpen(true);
+  };
+
+  const logout = async () => {
+    // 先撤销 FastAPI 的媒体桥接 Cookie，再清除 Supabase 的可刷新会话。
+    await api.logoutBridge();
+    await signOutAccount();
+    setAccountEmail(null);
+    resetWorkspace();
+    setHistory(await api.projects());
+    setAuthNotice("Signed out. New work will stay in this browser until you sign in again.");
   };
 
   const applyContextDraft = (draft: IntentRestatement, declaredStage: string) => {
@@ -370,8 +452,8 @@ function App() {
           {history.length === 0 && <p className="empty-history">Your critique history will appear here.</p>}
         </nav>
         <div className="sidebar-footer">
-          <span><Cloud size={15} /> AI vision</span>
-          <small>Private browser workspace</small>
+          <span><Cloud size={15} /> {accountEmail ? "Account sync on" : "AI vision"}</span>
+          <small>{accountEmail ? accountEmail : "Private browser workspace"}</small>
         </div>
       </aside>
 
@@ -382,8 +464,20 @@ function App() {
             <p className="eyebrow">Intent-aware illustration critique</p>
             <h1>{project?.title || "New critique"}</h1>
           </div>
-          <div className="status-pill"><span /> {busy ? "Working" : analysis ? "Analysis ready" : "Ready"}</div>
+          <div className="topbar-actions">
+            {authEnabled && (
+              <button className={`account-trigger ${accountEmail ? "signed-in" : ""}`} onClick={openAccount} title={accountEmail ?? "Sign in to sync your work"}>
+                {accountEmail ? <UserRound size={16} /> : <LogIn size={16} />}
+                <span>{accountEmail ? accountEmail.split("@")[0] : "Sign in"}</span>
+              </button>
+            )}
+            <div className="status-pill"><span /> {busy ? "Working" : analysis ? "Analysis ready" : "Ready"}</div>
+          </div>
         </header>
+
+        {authNotice && (
+          <div className="success-banner"><UserRound size={17} /><span>{authNotice}</span><button onClick={() => setAuthNotice(null)}><X size={16} /></button></div>
+        )}
 
         {error && (
           <div className="error-banner"><CircleHelp size={17} /><span>{error}</span><button onClick={() => setError(null)}><X size={16} /></button></div>
@@ -504,6 +598,15 @@ function App() {
           </div>
         )}
       </main>
+      <AuthDialog
+        open={authOpen}
+        mode={authMode}
+        accountEmail={accountEmail}
+        onModeChange={setAuthMode}
+        onClose={() => setAuthOpen(false)}
+        onAccountChanged={synchronizeAccount}
+        onSignOut={logout}
+      />
     </div>
   );
 }

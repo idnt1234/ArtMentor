@@ -17,9 +17,14 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
+from .auth import (
+    AuthServiceUnavailable,
+    InvalidAuthToken,
+    SupabaseAuthVerifier,
+)
 from .config import get_settings
 from .database import Base, engine, get_db, migrate_database
 from .models import (
@@ -65,10 +70,14 @@ from .services.pose_compare import compare_skeletons
 from .services.pose_inspect import inspect_skeleton
 from .services.storage import BlobStorage, build_storage
 from .security import (
+    ACCOUNT_COOKIE,
     AIGuard,
     SESSION_COOKIE,
+    account_owner_id,
     owner_hash,
     request_owner,
+    signed_account_cookie,
+    valid_account_cookie,
     valid_session_token,
 )
 
@@ -78,20 +87,24 @@ settings = get_settings()
 storage: BlobStorage | None = None
 ai: ArtMentorAI | None = None
 pose_client: PoseClient | None = None
+auth_verifier: SupabaseAuthVerifier | None = None
 ai_guard = AIGuard(settings)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """应用启动时建表/迁移，并初始化对象存储和 AI 客户端。"""
-    global storage, ai, pose_client
+    global storage, ai, pose_client, auth_verifier
     settings.ensure_local_dirs()
     Base.metadata.create_all(bind=engine)
     migrate_database()
     storage = build_storage(settings)
     ai = ArtMentorAI(settings)
     pose_client = build_pose_client(settings)
+    auth_verifier = SupabaseAuthVerifier(settings)
     yield
+    await auth_verifier.close()
+    auth_verifier = None
 
 
 app = FastAPI(
@@ -117,11 +130,42 @@ app.add_middleware(
 
 @app.middleware("http")
 async def anonymous_session(request: Request, call_next):
-    """用匿名 Cookie 隔离不同访客的数据，不要求注册或保存个人信息。"""
+    """建立匿名身份，并在 Supabase 令牌通过验证时升级为可恢复账户身份。"""
     token = valid_session_token(request.cookies.get(SESSION_COOKIE))
     is_new = token is None
     token = token or str(uuid.uuid4())
-    request.state.owner_id = owner_hash(token, settings.session_secret)
+    anonymous_owner_id = owner_hash(token, settings.session_secret)
+    account_user_id = valid_account_cookie(
+        request.cookies.get(ACCOUNT_COOKIE), settings.session_secret
+    )
+    bearer_user = None
+    authorization = request.headers.get("authorization", "").strip()
+    if request.url.path == f"{settings.api_prefix}/auth/logout":
+        # Logout must still clear the bridge when a revoked/expired bearer is present.
+        authorization = ""
+    if authorization:
+        scheme, separator, bearer_token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not separator or not bearer_token.strip():
+            return JSONResponse(status_code=401, content={"detail": "Invalid authorization header."})
+        if auth_verifier is None or not settings.auth_configured:
+            return JSONResponse(
+                status_code=503,
+                content={"detail": "Account sign-in is not configured."},
+            )
+        try:
+            bearer_user = await auth_verifier.verify(bearer_token.strip())
+            account_user_id = bearer_user.id
+        except InvalidAuthToken as exc:
+            return JSONResponse(status_code=401, content={"detail": str(exc)})
+        except AuthServiceUnavailable as exc:
+            return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+    request.state.anonymous_owner_id = anonymous_owner_id
+    request.state.auth_user_id = account_user_id
+    request.state.auth_email = bearer_user.email if bearer_user else None
+    request.state.owner_id = (
+        account_owner_id(account_user_id) if account_user_id else anonymous_owner_id
+    )
     provided_code = request.headers.get("x-artmentor-access-code", "")
     header_granted = bool(settings.demo_access_code) and hmac.compare_digest(
         provided_code, settings.demo_access_code
@@ -163,6 +207,29 @@ async def anonymous_session(request: Request, call_next):
             SESSION_COOKIE,
             token,
             max_age=60 * 60 * 24 * 365,
+            httponly=True,
+            secure=settings.session_cookie_secure,
+            samesite="lax",
+            path="/",
+        )
+    if getattr(request.state, "clear_account_cookie", False):
+        response.delete_cookie(
+            ACCOUNT_COOKIE,
+            httponly=True,
+            secure=settings.session_cookie_secure,
+            samesite="lax",
+            path="/",
+        )
+    elif bearer_user is not None:
+        # 普通 img 标签不能发送 Bearer Header；短期签名 Cookie 让私有媒体仍可鉴权。
+        response.set_cookie(
+            ACCOUNT_COOKIE,
+            signed_account_cookie(
+                bearer_user.id,
+                settings.session_secret,
+                settings.account_cookie_max_age,
+            ),
+            max_age=settings.account_cookie_max_age,
             httponly=True,
             secure=settings.session_cookie_secure,
             samesite="lax",
@@ -346,21 +413,50 @@ def health() -> dict:
         "openai_configured": bool(settings.openai_api_key),
         "model": settings.active_model,
         "storage": settings.storage_backend,
+        "auth_enabled": settings.auth_configured,
         "pose_enabled": settings.pose_feature_enabled,
         "pose_provider": settings.pose_provider,
     }
 
 
 @app.get(f"{settings.api_prefix}/session")
-def session_ready(request: Request) -> dict[str, bool]:
-    """告诉前端当前实例是否需要访问码，以及本次会话是否已经通过。"""
+def session_ready(request: Request, db: Session = Depends(get_db)) -> dict[str, object]:
+    """返回运行时配置，并把当前匿名作品安全归入已验证的登录账户。"""
+    claimed_projects = 0
+    auth_user_id = getattr(request.state, "auth_user_id", None)
+    if auth_user_id:
+        account_id = account_owner_id(auth_user_id)
+        anonymous_id = request.state.anonymous_owner_id
+        result = db.execute(
+            update(Project)
+            .where(Project.owner_id == anonymous_id)
+            .values(owner_id=account_id)
+        )
+        claimed_projects = int(result.rowcount or 0)
+        if claimed_projects:
+            db.commit()
     return {
         "ready": True,
         "access_required": bool(settings.demo_access_code),
         "access_granted": bool(request.state.access_granted),
         # 前端据此隐藏未部署的GPU功能，避免展示一个必定503的入口。
         "pose_enabled": settings.pose_feature_enabled,
+        "auth_enabled": settings.auth_configured,
+        "auth_user_id": auth_user_id,
+        "auth_email": getattr(request.state, "auth_email", None),
+        "supabase_url": settings.supabase_url if settings.auth_configured else None,
+        "supabase_publishable_key": (
+            settings.supabase_publishable_key if settings.auth_configured else None
+        ),
+        "claimed_projects": claimed_projects,
     }
+
+
+@app.post(f"{settings.api_prefix}/auth/logout", status_code=204)
+def logout_account(request: Request) -> Response:
+    """清除 FastAPI 的短期账户桥接 Cookie；Supabase 会由浏览器随后退出。"""
+    request.state.clear_account_cookie = True
+    return Response(status_code=204)
 
 
 @app.get(f"{settings.api_prefix}/media/{{key}}")

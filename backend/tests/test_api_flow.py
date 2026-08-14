@@ -10,7 +10,10 @@ import io
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 
+import app.main as main_module
+from app.auth import AuthUser, InvalidAuthToken
 from app.main import app, settings
+from app.security import ACCOUNT_COOKIE
 
 
 def artwork_bytes(shift: int = 0) -> bytes:
@@ -329,3 +332,103 @@ def test_session_exposes_pose_feature_flag_for_safe_frontend_gating() -> None:
             assert enabled.json()["pose_enabled"] is True
     finally:
         settings.pose_feature_enabled = original
+
+
+class FakeAuthVerifier:
+    """Offline Supabase stand-in: tests identity transitions without network access."""
+
+    users = {
+        "account-a": AuthUser(
+            id="11111111-1111-4111-8111-111111111111", email="artist-a@example.com"
+        ),
+        "account-b": AuthUser(
+            id="22222222-2222-4222-8222-222222222222", email="artist-b@example.com"
+        ),
+    }
+
+    async def verify(self, token: str) -> AuthUser:
+        if token not in self.users:
+            raise InvalidAuthToken("Your sign-in session has expired. Please sign in again.")
+        return self.users[token]
+
+
+def test_account_login_claims_anonymous_projects_and_preserves_media_privacy() -> None:
+    """登录认领当前匿名数据，跨浏览器可恢复，其他账号和退出后仍无法读取。"""
+    original_url = settings.supabase_url
+    original_key = settings.supabase_publishable_key
+    settings.supabase_url = "https://example.supabase.co"
+    settings.supabase_publishable_key = "sb_publishable_test"
+    try:
+        with TestClient(app) as client:
+            real_verifier = main_module.auth_verifier
+            main_module.auth_verifier = FakeAuthVerifier()  # type: ignore[assignment]
+            try:
+                created = client.post(
+                    "/api/projects",
+                    data={
+                        "title": "Claim this study",
+                        "stage": "Sketch",
+                        "style": "Digital illustration",
+                        "intent": "Keep this anonymous study when I create my permanent account.",
+                    },
+                    files={"image": ("claim.png", artwork_bytes(), "image/png")},
+                )
+                assert created.status_code == 200, created.text
+                project = created.json()
+
+                claimed = client.get(
+                    "/api/session", headers={"Authorization": "Bearer account-a"}
+                )
+                assert claimed.status_code == 200, claimed.text
+                assert claimed.json()["auth_user_id"] == FakeAuthVerifier.users["account-a"].id
+                assert claimed.json()["auth_email"] == "artist-a@example.com"
+                assert claimed.json()["claimed_projects"] == 1
+
+                # Subsequent img/navigation requests have no Bearer header; the short-lived,
+                # signed HttpOnly bridge cookie must still authorize account-owned media.
+                assert project["id"] in {
+                    item["id"] for item in client.get("/api/projects").json()
+                }
+                assert client.get(project["image_url"]).status_code == 200
+
+                # Another account in the same browser cannot claim records already owned by A.
+                client.cookies.delete(ACCOUNT_COOKIE)
+                account_b = client.get(
+                    "/api/session", headers={"Authorization": "Bearer account-b"}
+                )
+                assert account_b.status_code == 200
+                assert account_b.json()["claimed_projects"] == 0
+                assert project["id"] not in {
+                    item["id"] for item in client.get("/api/projects").json()
+                }
+
+                # Account A can recover the same history in a clean browser session.
+                client.cookies.clear()
+                restored = client.get(
+                    "/api/session", headers={"Authorization": "Bearer account-a"}
+                )
+                assert restored.status_code == 200
+                assert restored.json()["claimed_projects"] == 0
+                assert project["id"] in {
+                    item["id"] for item in client.get("/api/projects").json()
+                }
+                assert client.get(project["image_url"]).status_code == 200
+
+                logged_out = client.post(
+                    "/api/auth/logout", headers={"Authorization": "Bearer account-a"}
+                )
+                assert logged_out.status_code == 204
+                assert project["id"] not in {
+                    item["id"] for item in client.get("/api/projects").json()
+                }
+                assert client.get(project["image_url"]).status_code == 404
+
+                invalid = client.get(
+                    "/api/session", headers={"Authorization": "Bearer invalid"}
+                )
+                assert invalid.status_code == 401
+            finally:
+                main_module.auth_verifier = real_verifier
+    finally:
+        settings.supabase_url = original_url
+        settings.supabase_publishable_key = original_key

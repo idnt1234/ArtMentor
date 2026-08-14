@@ -8,6 +8,8 @@ This production path keeps the public application in one Render Docker web servi
 2. In Storage, create a **private** bucket named `artmentor-artworks`.
 3. In the project connection settings, copy the PostgreSQL connection string. Prefer the session pooler when the direct database endpoint is not reachable over IPv4. Keep `sslmode=require` in the URL.
 4. In Storage S3 settings, create an S3 access key and note the endpoint, region, access key ID, and secret access key.
+5. In Authentication providers, keep Email enabled, allow new sign-ups, and keep Confirm Email enabled.
+6. In Authentication URL Configuration, set Site URL to the exact Render HTTPS origin. Add that same origin and `http://localhost:5173/**` to Redirect URLs.
 
 Do not commit any copied value. ArtMentor accepts Supabase's normal `postgresql://...` URL and switches it to the installed psycopg 3 driver internally.
 
@@ -33,6 +35,7 @@ Enter these only in Render's Blueprint secret prompts:
 | `DATABASE_URL` | Supabase PostgreSQL connection string, including `sslmode=require` |
 | `S3_ACCESS_KEY` | Supabase Storage S3 access key ID |
 | `S3_SECRET_KEY` | Supabase Storage S3 secret access key |
+| `SUPABASE_PUBLISHABLE_KEY` | Supabase project's browser-safe publishable key (`sb_publishable_...`); never use a secret/service-role key |
 | `GPTSAPI_KEY` | WildAI / GPTsAPI key |
 | `DEMO_ACCESS_CODE` | A code shared only with reviewers and testers |
 | `POSE_WORKER_URL` | Private GPU worker HTTPS base address, without `/health` |
@@ -51,6 +54,7 @@ The checked-in `render.yaml` supplies these non-secret variables:
 | `S3_BUCKET` | `artmentor-artworks` |
 | `S3_REGION` | Region shown in the Supabase S3 settings |
 | `S3_AUTO_CREATE_BUCKET` | `false` |
+| `SUPABASE_URL` | Supabase project URL, supplied by the Blueprint for the current project |
 | `SESSION_COOKIE_SECURE` | `true` |
 | `MAX_UPLOAD_MB` | `10` |
 | `ANALYSIS_MAX_SIDE` | `1600` |
@@ -62,6 +66,18 @@ The checked-in `render.yaml` supplies these non-secret variables:
 | `POSE_WORKER_TIMEOUT_SECONDS` | `45` |
 
 The access code is optional in code, but required by this Blueprint prompt and strongly recommended because every successful critique spends a shared third-party API allowance.
+
+### Enable account email delivery
+
+The first version supports email/password sign-up, confirmation, sign-in,
+sign-out, and password reset. Supabase's default SMTP is only suitable for
+testing with organization-team addresses and is heavily rate-limited. Before
+allowing public registration, configure a custom SMTP provider in Supabase
+Authentication settings. Keep the demo access code enabled while testing.
+
+The browser receives only `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY`. S3
+credentials, database credentials, Supabase secret/service-role keys, and JWT
+signing secrets must never be placed in either frontend code or that variable.
 
 ### Enable the separate 2D pose worker
 
@@ -92,11 +108,14 @@ After Render reports **Live**:
 5. Upload a revision and confirm the before/after report survives a Render restart.
 6. When pose is enabled, estimate one artwork skeleton, correct a point, save it,
    run the 2D check, refresh the page, and confirm the corrected skeleton remains.
+7. Create an anonymous project, register and confirm a test account, then sign in. Confirm the project remains visible after clearing site data and signing in from a second browser profile.
+8. Sign out and confirm the account project and its direct `/api/media/...` URL are no longer readable. Request a password reset and confirm the email returns to the Render site with the new-password dialog.
 
 ## Privacy and operational limits
 
-- The anonymous HttpOnly cookie separates visitors without collecting an email or username.
-- Clearing that cookie makes the old history inaccessible to that browser; it does not delete the stored data. Account login and self-service deletion belong in the next version.
+- The anonymous HttpOnly cookie separates visitors without collecting an email or username. Anonymous use remains available when Auth is disabled or the visitor chooses not to register.
+- A verified account can claim the current browser's anonymous history and recover it on another device. Clearing the anonymous cookie before the first login still makes that unclaimed history inaccessible.
+- Self-service account/data deletion is not included in this first version and must be added before presenting the service as a complete public account lifecycle.
 - Uploaded images are private application objects, but they are sent to the configured vision provider for the requested visual context check and again for the confirmed critique.
 - Rate limits are in memory and reset when the service restarts. The access code is the main cost-control boundary for this MVP.
 - Render's local filesystem is not used for production data, so sleep or rebuild does not remove Supabase records or images.

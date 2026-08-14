@@ -33,6 +33,12 @@ services:
         sync: false
       - key: S3_SECRET_KEY
         sync: false
+      # Supabase Auth is optional until both values are present. The publishable
+      # key is browser-safe; never substitute a secret/service-role key.
+      - key: SUPABASE_URL
+        value: https://xvmyxrwipzlqtljnkkhj.supabase.co
+      - key: SUPABASE_PUBLISHABLE_KEY
+        sync: false
       - key: SESSION_SECRET
         generateValue: true
       - key: SESSION_COOKIE_SECURE
