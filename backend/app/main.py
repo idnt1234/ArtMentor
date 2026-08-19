@@ -8,27 +8,35 @@
 main.py 只负责安排调用顺序和处理接口错误。
 """
 
-import uuid
 import hmac
+import io
+import json
+import uuid
+import zipfile
 from contextlib import asynccontextmanager
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, update
+from sqlalchemy import delete, inspect as sa_inspect, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .auth import (
     AuthServiceUnavailable,
+    AuthAdminUnavailable,
     InvalidAuthToken,
+    SupabaseAuthAdmin,
     SupabaseAuthVerifier,
 )
 from .config import get_settings
 from .database import Base, engine, get_db, migrate_database
 from .models import (
     Analysis,
+    AccountDailyUsage,
     Feedback,
     PoseComparison,
     PoseInspection,
@@ -37,6 +45,7 @@ from .models import (
 )
 from .schemas import (
     AnalysisResponse,
+    AccountDeleteRequest,
     AnnotationUpdateRequest,
     ComparisonResult,
     ConfirmIntentRequest,
@@ -88,13 +97,14 @@ storage: BlobStorage | None = None
 ai: ArtMentorAI | None = None
 pose_client: PoseClient | None = None
 auth_verifier: SupabaseAuthVerifier | None = None
+auth_admin: SupabaseAuthAdmin | None = None
 ai_guard = AIGuard(settings)
 
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """应用启动时建表/迁移，并初始化对象存储和 AI 客户端。"""
-    global storage, ai, pose_client, auth_verifier
+    global storage, ai, pose_client, auth_verifier, auth_admin
     settings.ensure_local_dirs()
     Base.metadata.create_all(bind=engine)
     migrate_database()
@@ -102,9 +112,12 @@ async def lifespan(_app: FastAPI):
     ai = ArtMentorAI(settings)
     pose_client = build_pose_client(settings)
     auth_verifier = SupabaseAuthVerifier(settings)
+    auth_admin = SupabaseAuthAdmin(settings)
     yield
     await auth_verifier.close()
+    await auth_admin.close()
     auth_verifier = None
+    auth_admin = None
 
 
 app = FastAPI(
@@ -165,6 +178,7 @@ async def anonymous_session(request: Request, call_next):
     request.state.anonymous_owner_id = anonymous_owner_id
     request.state.auth_user_id = account_user_id
     request.state.auth_email = bearer_user.email if bearer_user else account_email
+    request.state.auth_bearer_verified = bearer_user is not None
     request.state.owner_id = (
         account_owner_id(account_user_id) if account_user_id else anonymous_owner_id
     )
@@ -188,19 +202,29 @@ async def anonymous_session(request: Request, call_next):
         f"{settings.api_prefix}/health",
         f"{settings.api_prefix}/session",
         f"{settings.api_prefix}/samples",
+        f"{settings.api_prefix}/auth/logout",
     }
     is_public_asset = request.url.path.startswith(
         f"{settings.api_prefix}/sample-assets/"
     )
-    if (
+    is_private_api = (
         request.url.path.startswith(settings.api_prefix)
         and request.url.path not in public_api_paths
         and not is_public_asset
-        and not request.state.access_granted
-    ):
+    )
+    if is_private_api and not request.state.access_granted:
         response = JSONResponse(
             status_code=401,
             content={"detail": "Enter the ArtMentor demo access code to continue."},
+        )
+    elif (
+        is_private_api
+        and settings.require_account_for_work
+        and not request.state.auth_user_id
+    ):
+        response = JSONResponse(
+            status_code=401,
+            content={"detail": "Sign in to create or open ArtMentor work."},
         )
     else:
         response = await call_next(request)
@@ -316,9 +340,79 @@ def _owned_pose_comparison(
     return comparison
 
 
-def _limit_ai(request: Request) -> None:
-    """在真正调用收费模型前执行按来源限流。"""
+def _today_utc() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _usage_for(db: Session, account_user_id: str) -> AccountDailyUsage | None:
+    return db.scalar(
+        select(AccountDailyUsage).where(
+            AccountDailyUsage.account_user_id == account_user_id,
+            AccountDailyUsage.usage_date == _today_utc(),
+        )
+    )
+
+
+def _limit_ai(request: Request, db: Session) -> None:
+    """Apply both IP throttling and a durable per-account UTC-day allowance."""
     ai_guard.check_rate(request)
+    account_user_id = getattr(request.state, "auth_user_id", None)
+    if not account_user_id or settings.account_daily_ai_limit <= 0:
+        return
+    usage_date = _today_utc()
+
+    def increment_existing() -> bool:
+        result = db.execute(
+            update(AccountDailyUsage)
+            .where(
+                AccountDailyUsage.account_user_id == account_user_id,
+                AccountDailyUsage.usage_date == usage_date,
+                AccountDailyUsage.ai_calls < settings.account_daily_ai_limit,
+            )
+            .values(ai_calls=AccountDailyUsage.ai_calls + 1)
+        )
+        if int(result.rowcount or 0) == 1:
+            db.commit()
+            return True
+        return False
+
+    if increment_existing():
+        return
+    usage = _usage_for(db, account_user_id)
+    if usage is None:
+        db.add(
+            AccountDailyUsage(
+                account_user_id=account_user_id,
+                usage_date=usage_date,
+                ai_calls=1,
+            )
+        )
+        try:
+            db.commit()
+            return
+        except IntegrityError:
+            # Another request created today's unique row first; retry the bounded
+            # conditional increment instead of leaking a database error.
+            db.rollback()
+            if increment_existing():
+                return
+    raise HTTPException(
+        429,
+        f"Daily AI limit reached ({settings.account_daily_ai_limit}). It resets at 00:00 UTC.",
+    )
+
+
+def _export_value(value):
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    return value
+
+
+def _export_record(record) -> dict[str, object]:
+    return {
+        column.key: _export_value(getattr(record, column.key))
+        for column in sa_inspect(record).mapper.column_attrs
+    }
 
 
 async def _read_upload(upload: UploadFile) -> tuple[bytes, str]:
@@ -417,6 +511,8 @@ def health() -> dict:
         "model": settings.active_model,
         "storage": settings.storage_backend,
         "auth_enabled": settings.auth_configured,
+        "account_required": settings.require_account_for_work,
+        "account_deletion_enabled": settings.auth_admin_configured,
         "pose_enabled": settings.pose_feature_enabled,
         "pose_provider": settings.pose_provider,
     }
@@ -438,6 +534,13 @@ def session_ready(request: Request, db: Session = Depends(get_db)) -> dict[str, 
         claimed_projects = int(result.rowcount or 0)
         if claimed_projects:
             db.commit()
+    usage = _usage_for(db, auth_user_id) if auth_user_id else None
+    daily_limit = (
+        settings.account_daily_ai_limit
+        if settings.account_daily_ai_limit > 0
+        else None
+    )
+    daily_used = usage.ai_calls if usage else 0
     return {
         "ready": True,
         "access_required": bool(settings.demo_access_code),
@@ -445,6 +548,8 @@ def session_ready(request: Request, db: Session = Depends(get_db)) -> dict[str, 
         # 前端据此隐藏未部署的GPU功能，避免展示一个必定503的入口。
         "pose_enabled": settings.pose_feature_enabled,
         "auth_enabled": settings.auth_configured,
+        "account_required": settings.require_account_for_work,
+        "account_deletion_enabled": settings.auth_admin_configured,
         "auth_user_id": auth_user_id,
         "auth_email": getattr(request.state, "auth_email", None),
         "supabase_url": settings.supabase_url if settings.auth_configured else None,
@@ -452,12 +557,199 @@ def session_ready(request: Request, db: Session = Depends(get_db)) -> dict[str, 
             settings.supabase_publishable_key if settings.auth_configured else None
         ),
         "claimed_projects": claimed_projects,
+        "daily_ai_limit": daily_limit,
+        "daily_ai_used": daily_used,
+        "daily_ai_remaining": (
+            max(daily_limit - daily_used, 0) if daily_limit is not None else None
+        ),
     }
 
 
 @app.post(f"{settings.api_prefix}/auth/logout", status_code=204)
 def logout_account(request: Request) -> Response:
     """清除 FastAPI 的短期账户桥接 Cookie；Supabase 会由浏览器随后退出。"""
+    request.state.clear_account_cookie = True
+    return Response(status_code=204)
+
+
+@app.get(f"{settings.api_prefix}/account/export")
+def export_account_data(
+    request: Request,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> StreamingResponse:
+    """Return the signed-in user's database records and private images as a ZIP."""
+    account_user_id = getattr(request.state, "auth_user_id", None)
+    if not account_user_id:
+        raise HTTPException(401, "Sign in to export account data.")
+    projects = list(
+        db.scalars(select(Project).where(Project.owner_id == owner_id)).all()
+    )
+    project_ids = [project.id for project in projects]
+    analyses = (
+        list(db.scalars(select(Analysis).where(Analysis.project_id.in_(project_ids))).all())
+        if project_ids
+        else []
+    )
+    analysis_ids = [analysis.id for analysis in analyses]
+    feedback = (
+        list(db.scalars(select(Feedback).where(Feedback.analysis_id.in_(analysis_ids))).all())
+        if analysis_ids
+        else []
+    )
+    revisions = (
+        list(db.scalars(select(Revision).where(Revision.project_id.in_(project_ids))).all())
+        if project_ids
+        else []
+    )
+    pose_comparisons = (
+        list(
+            db.scalars(
+                select(PoseComparison).where(PoseComparison.project_id.in_(project_ids))
+            ).all()
+        )
+        if project_ids
+        else []
+    )
+    pose_inspections = (
+        list(
+            db.scalars(
+                select(PoseInspection).where(PoseInspection.project_id.in_(project_ids))
+            ).all()
+        )
+        if project_ids
+        else []
+    )
+    usage = list(
+        db.scalars(
+            select(AccountDailyUsage).where(
+                AccountDailyUsage.account_user_id == account_user_id
+            )
+        ).all()
+    )
+    manifest = {
+        "schema_version": 1,
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "account": {
+            "id": account_user_id,
+            "email": getattr(request.state, "auth_email", None),
+        },
+        "projects": [_export_record(item) for item in projects],
+        "analyses": [_export_record(item) for item in analyses],
+        "feedback": [_export_record(item) for item in feedback],
+        "revisions": [_export_record(item) for item in revisions],
+        "pose_comparisons": [_export_record(item) for item in pose_comparisons],
+        "pose_inspections": [_export_record(item) for item in pose_inspections],
+        "daily_usage": [_export_record(item) for item in usage],
+    }
+    archive = io.BytesIO()
+    blobs = _storage()
+    try:
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            bundle.writestr(
+                "account.json",
+                json.dumps(manifest, ensure_ascii=False, indent=2),
+            )
+            for project in projects:
+                suffix = Path(project.image_key).suffix or ".bin"
+                bundle.writestr(
+                    f"images/projects/{project.id}/original{suffix}",
+                    blobs.read(project.image_key),
+                )
+            for revision in revisions:
+                suffix = Path(revision.image_key).suffix or ".bin"
+                bundle.writestr(
+                    f"images/projects/{revision.project_id}/revisions/{revision.id}{suffix}",
+                    blobs.read(revision.image_key),
+                )
+            for comparison in pose_comparisons:
+                suffix = Path(comparison.reference_image_key).suffix or ".bin"
+                bundle.writestr(
+                    f"images/projects/{comparison.project_id}/pose-references/{comparison.id}{suffix}",
+                    blobs.read(comparison.reference_image_key),
+                )
+    except Exception as exc:
+        raise HTTPException(502, "Could not assemble the account export.") from exc
+    archive.seek(0)
+    filename = f"ArtMentor-export-{_today_utc().isoformat()}.zip"
+    return StreamingResponse(
+        archive,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.delete(f"{settings.api_prefix}/account", status_code=204)
+async def delete_account(
+    body: AccountDeleteRequest,
+    request: Request,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> Response:
+    """Permanently delete owned blobs, app records, and the Supabase Auth identity."""
+    account_user_id = getattr(request.state, "auth_user_id", None)
+    if not account_user_id or not getattr(request.state, "auth_bearer_verified", False):
+        raise HTTPException(401, "Reauthenticate before deleting your account.")
+    if auth_admin is None or not auth_admin.enabled:
+        raise HTTPException(
+            503,
+            "Account deletion is not configured. Contact the site operator.",
+        )
+    projects = list(
+        db.scalars(select(Project).where(Project.owner_id == owner_id)).all()
+    )
+    project_ids = [project.id for project in projects]
+    analyses = (
+        list(db.scalars(select(Analysis).where(Analysis.project_id.in_(project_ids))).all())
+        if project_ids
+        else []
+    )
+    analysis_ids = [analysis.id for analysis in analyses]
+    revisions = (
+        list(db.scalars(select(Revision).where(Revision.project_id.in_(project_ids))).all())
+        if project_ids
+        else []
+    )
+    pose_comparisons = (
+        list(
+            db.scalars(
+                select(PoseComparison).where(PoseComparison.project_id.in_(project_ids))
+            ).all()
+        )
+        if project_ids
+        else []
+    )
+    keys = [project.image_key for project in projects]
+    keys.extend(revision.image_key for revision in revisions)
+    keys.extend(item.reference_image_key for item in pose_comparisons)
+    try:
+        for key in set(keys):
+            _storage().delete(key)
+    except Exception as exc:
+        raise HTTPException(
+            502, "Could not remove all private images. No database records were deleted."
+        ) from exc
+    if analysis_ids:
+        db.execute(delete(Feedback).where(Feedback.analysis_id.in_(analysis_ids)))
+    if project_ids:
+        db.execute(delete(PoseInspection).where(PoseInspection.project_id.in_(project_ids)))
+        db.execute(delete(PoseComparison).where(PoseComparison.project_id.in_(project_ids)))
+        db.execute(delete(Revision).where(Revision.project_id.in_(project_ids)))
+        db.execute(delete(Analysis).where(Analysis.project_id.in_(project_ids)))
+        db.execute(delete(Project).where(Project.id.in_(project_ids)))
+    db.execute(
+        delete(AccountDailyUsage).where(
+            AccountDailyUsage.account_user_id == account_user_id
+        )
+    )
+    db.commit()
+    try:
+        await auth_admin.delete_user(account_user_id)
+    except AuthAdminUnavailable as exc:
+        raise HTTPException(
+            502,
+            "Your ArtMentor work was removed, but the sign-in identity could not be deleted. Retry account deletion.",
+        ) from exc
     request.state.clear_account_cookie = True
     return Response(status_code=204)
 
@@ -619,7 +911,7 @@ def restate_intent(
         image_data, settings.analysis_max_side
     )
     del image_data
-    _limit_ai(request)
+    _limit_ai(request, db)
     with ai_guard.slot():
         generated = _ai().restate_intent(
             project.intent_original,
@@ -661,7 +953,7 @@ def analyze_project(
         image_data, settings.analysis_max_side
     )
     del image_data
-    _limit_ai(http_request)
+    _limit_ai(http_request, db)
     with ai_guard.slot():
         generated = _ai().critique(
             image=analysis_image,
@@ -1091,7 +1383,7 @@ async def create_revision(
     after_analysis_image, after_analysis_mime = prepare_analysis_image(
         after_data, settings.analysis_max_side
     )
-    _limit_ai(request)
+    _limit_ai(request, db)
     with ai_guard.slot():
         generated = _ai().compare(
             before_image=before_analysis_image,

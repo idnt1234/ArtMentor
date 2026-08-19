@@ -5,7 +5,7 @@
  * 并通过 api.ts 调用后端。画布、参考作品和前后对比分别交给独立组件渲染，
  * 因此这里主要负责业务流程，不负责网络协议或 AI Prompt。
  */
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   Check,
@@ -35,6 +35,7 @@ import {
 } from "lucide-react";
 import { api, assetUrl, setDemoAccessCode } from "./api";
 import {
+  clearDeletedAccountSession,
   configureAuth,
   currentAuth,
   listenForAuthChanges,
@@ -114,15 +115,18 @@ function App() {
   const [feedback, setFeedback] = useState<Record<string, string>>({});
   const [intentionalTarget, setIntentionalTarget] = useState<string | null>(null);
   const [intentionalReason, setIntentionalReason] = useState("");
-  // 公网 Demo 使用访问码控制共享 AI 额度；真正的数据隔离由后端匿名 Cookie 完成。
+  // 公网 Demo 可暂时使用访问码控制共享预算；公开版的工作区由账户隔离。
   const [accessRequired, setAccessRequired] = useState(false);
   const [accessCode, setAccessCode] = useState("");
   const [accessBusy, setAccessBusy] = useState(false);
   // 后端部署开关决定是否展示GPU人体功能；未配置Worker时不显示失效入口。
   const [poseEnabled, setPoseEnabled] = useState(false);
-  // Supabase 负责可恢复账户；未登录时继续沿用原来的匿名浏览器工作区。
+  // Supabase 负责可恢复账户；公开主页可匿名浏览，创作工作区需要登录。
   const [authEnabled, setAuthEnabled] = useState(false);
   const [accountEmail, setAccountEmail] = useState<string | null>(null);
+  const [accountDeletionEnabled, setAccountDeletionEnabled] = useState(false);
+  const [dailyAiLimit, setDailyAiLimit] = useState<number | null>(null);
+  const [dailyAiRemaining, setDailyAiRemaining] = useState<number | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [authMode, setAuthMode] = useState<AuthMode>("signin");
   const [authNotice, setAuthNotice] = useState<string | null>(null);
@@ -137,20 +141,47 @@ function App() {
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const previewUrl = useMemo(() => (uploadFile ? URL.createObjectURL(uploadFile) : null), [uploadFile]);
 
+  const applySessionStatus = useCallback((session: Awaited<ReturnType<typeof api.session>>) => {
+    setPoseEnabled(session.pose_enabled);
+    setAuthEnabled(session.auth_enabled);
+    setAccountDeletionEnabled(session.account_deletion_enabled);
+    setDailyAiLimit(session.daily_ai_limit);
+    setDailyAiRemaining(session.daily_ai_remaining);
+  }, []);
+
+  const synchronizeAccount = useCallback(async () => {
+    const account = await currentAuth();
+    const session = await api.session();
+    applySessionStatus(session);
+    setAccountEmail(
+      account.user?.email
+      ?? session.auth_email
+      ?? (session.auth_user_id ? "ArtMentor account" : null),
+    );
+    if (session.claimed_projects > 0) {
+      setAuthNotice(`${session.claimed_projects} browser ${session.claimed_projects === 1 ? "project is" : "projects are"} now saved to your account.`);
+    }
+    if (session.auth_user_id && (!session.access_required || session.access_granted)) {
+      setHistory(await api.projects());
+    } else {
+      setHistory([]);
+    }
+  }, [applySessionStatus]);
+
   useEffect(() => {
     // 启动时读取公开运行时配置，再恢复 Supabase 会话并认领当前匿名作品。
     let disposed = false;
     let stopListening: (() => void) | undefined;
     const bootstrap = async () => {
       let session = await api.session();
-      setPoseEnabled(session.pose_enabled);
-      setAuthEnabled(session.auth_enabled);
+      applySessionStatus(session);
       if (session.auth_enabled && session.supabase_url && session.supabase_publishable_key) {
         configureAuth(session.supabase_url, session.supabase_publishable_key);
         const account = await currentAuth();
         if (account.session) {
           // 第二次会话请求携带已恢复的 Bearer Token，并在后端认领匿名作品。
           session = await api.session();
+          applySessionStatus(session);
         } else if (session.auth_user_id) {
           // 部分浏览器会阻止 Supabase 恢复本地存储；此时继续使用后端已签名、
           // 有限时效的 HttpOnly 会话，而不是在刷新时把有效登录主动清除。
@@ -185,16 +216,15 @@ function App() {
         setAccessRequired(true);
         return;
       }
-      const [sampleData, projects] = await Promise.all([api.samples(), api.projects()]);
-      setSamples(sampleData);
-      setHistory(projects);
+      setSamples(await api.samples());
+      setHistory(session.auth_user_id ? await api.projects() : []);
     };
     bootstrap().catch((cause: Error) => setError(cause.message));
     return () => {
       disposed = true;
       stopListening?.();
     };
-  }, []);
+  }, [applySessionStatus, synchronizeAccount]);
 
   useEffect(() => () => {
     // createObjectURL 会占用浏览器内存，切换文件或离开组件时必须释放。
@@ -204,18 +234,6 @@ function App() {
   // 每次产生新项目或新点评后重新读取历史，确保侧栏与数据库一致。
   const refreshHistory = async () => setHistory(await api.projects());
 
-  const synchronizeAccount = async () => {
-    const account = await currentAuth();
-    const session = await api.session();
-    setAccountEmail(account.user?.email ?? session.auth_email);
-    if (session.claimed_projects > 0) {
-      setAuthNotice(`${session.claimed_projects} browser ${session.claimed_projects === 1 ? "project is" : "projects are"} now saved to your account.`);
-    }
-    if (!session.access_required || session.access_granted) {
-      setHistory(await api.projects());
-    }
-  };
-
   const unlockDemo = async () => {
     // 访问码验证成功后，后端还会写入 HttpOnly Cookie，供后续图片请求使用。
     if (!accessCode.trim()) return;
@@ -224,11 +242,10 @@ function App() {
     try {
       setDemoAccessCode(accessCode);
       const session = await api.session();
-      setPoseEnabled(session.pose_enabled);
+      applySessionStatus(session);
       if (!session.access_granted) throw new Error("That access code is not correct.");
-      const [sampleData, projects] = await Promise.all([api.samples(), api.projects()]);
-      setSamples(sampleData);
-      setHistory(projects);
+      setSamples(await api.samples());
+      setHistory(session.auth_user_id ? await api.projects() : []);
       setAccessRequired(false);
     } catch (cause) {
       setDemoAccessCode("");
@@ -258,14 +275,30 @@ function App() {
     setAuthOpen(true);
   };
 
+  const requireSignIn = () => {
+    setAuthMode("signin");
+    setAuthOpen(true);
+  };
+
   const logout = async () => {
     // 先撤销 FastAPI 的媒体桥接 Cookie，再清除 Supabase 的可刷新会话。
     await api.logoutBridge();
     await signOutAccount();
     setAccountEmail(null);
+    setDailyAiRemaining(null);
     resetWorkspace();
-    setHistory(await api.projects());
-    setAuthNotice("Signed out. New work will stay in this browser until you sign in again.");
+    setHistory([]);
+    setAuthNotice("Signed out. Sign in again whenever you want to create or open work.");
+  };
+
+  const deleteCurrentAccount = async () => {
+    await api.deleteAccount();
+    await clearDeletedAccountSession();
+    setAccountEmail(null);
+    setDailyAiRemaining(null);
+    setHistory([]);
+    resetWorkspace();
+    setAuthNotice("Your account and ArtMentor data were permanently deleted.");
   };
 
   const applyContextDraft = (draft: IntentRestatement, declaredStage: string) => {
@@ -310,6 +343,10 @@ function App() {
   };
 
   const uploadArtwork = async () => {
+    if (!accountEmail) {
+      requireSignIn();
+      return;
+    }
     if (!uploadFile || form.intent.trim().length < 8) {
       setError("Add an artwork and describe what you want the viewer to feel or notice.");
       return;
@@ -329,6 +366,7 @@ function App() {
       const restated = await api.restateIntent(created.id);
       applyContextDraft(restated, created.stage);
       await refreshHistory();
+      await synchronizeAccount();
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -337,6 +375,10 @@ function App() {
   };
 
   const importSample = async (sampleId: string) => {
+    if (!accountEmail) {
+      requireSignIn();
+      return;
+    }
     // 公共领域样例和用户上传走相同 Project/Intent/Analysis 流程，便于可靠演示。
     setBusy("upload");
     setError(null);
@@ -346,6 +388,7 @@ function App() {
       const restated = await api.restateIntent(created.id);
       applyContextDraft(restated, created.stage);
       await refreshHistory();
+      await synchronizeAccount();
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -365,6 +408,7 @@ function App() {
       setActiveSuggestion(result.result.suggestions[0]?.id ?? null);
       setTab(defaultResultTab(confirmedStage, poseEnabled));
       await refreshHistory();
+      await synchronizeAccount();
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -407,6 +451,7 @@ function App() {
       const result = await api.revision(project.id, analysis.id, file);
       setRevision(result);
       setTab("revision");
+      await synchronizeAccount();
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -456,7 +501,7 @@ function App() {
         </nav>
         <div className="sidebar-footer">
           <span><Cloud size={15} /> {accountEmail ? "Account sync on" : "AI vision"}</span>
-          <small>{accountEmail ? accountEmail : "Private browser workspace"}</small>
+          <small>{accountEmail ? accountEmail : "Sign in to create critiques"}</small>
         </div>
       </aside>
 
@@ -498,6 +543,8 @@ function App() {
             busy={busy}
             onSubmit={uploadArtwork}
             onSample={importSample}
+            signedIn={Boolean(accountEmail)}
+            onRequireSignIn={requireSignIn}
           />
         )}
 
@@ -605,10 +652,15 @@ function App() {
         open={authOpen}
         mode={authMode}
         accountEmail={accountEmail}
+        dailyAiLimit={dailyAiLimit}
+        dailyAiRemaining={dailyAiRemaining}
+        deletionEnabled={accountDeletionEnabled}
         onModeChange={setAuthMode}
         onClose={() => setAuthOpen(false)}
         onAccountChanged={synchronizeAccount}
         onSignOut={logout}
+        onExport={api.exportAccount}
+        onDelete={deleteCurrentAccount}
       />
     </div>
   );
@@ -654,9 +706,11 @@ interface UploadProps {
   busy: Busy;
   onSubmit: () => void;
   onSample: (id: string) => void;
+  signedIn: boolean;
+  onRequireSignIn: () => void;
 }
 
-function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl, fileRef, samples, busy, onSubmit, onSample }: UploadProps) {
+function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl, fileRef, samples, busy, onSubmit, onSample, signedIn, onRequireSignIn }: UploadProps) {
   // 首屏收集模型理解作品所需的最小上下文，也提供无需上传的公共领域样例入口。
   const update = (key: keyof UploadProps["form"], value: string) => setForm((current) => ({ ...current, [key]: value }));
   return (
@@ -673,34 +727,43 @@ function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl,
       </section>
 
       <section className="upload-card">
-        <button className={`drop-zone ${previewUrl ? "has-image" : ""}`} onClick={() => fileRef.current?.click()}>
+        <button className={`drop-zone ${previewUrl ? "has-image" : ""}`} onClick={() => signedIn ? fileRef.current?.click() : onRequireSignIn()}>
           {previewUrl ? <img src={previewUrl} alt="Artwork preview" /> : <><span className="upload-icon"><Upload size={22} /></span><strong>Drop your artwork here</strong><small>JPG, PNG or WebP · up to 10 MB</small></>}
           {previewUrl && <span className="change-image">Change artwork</span>}
         </button>
-        <input ref={fileRef} hidden type="file" accept="image/jpeg,image/png,image/webp" onChange={(event) => setUploadFile(event.target.files?.[0] ?? null)} />
+        <input ref={fileRef} hidden type="file" accept="image/jpeg,image/png,image/webp" disabled={!signedIn} onChange={(event) => setUploadFile(event.target.files?.[0] ?? null)} />
         <div className="form-grid">
           <label className="full"><span>Project title <em>optional</em></span><input value={form.title} onChange={(e) => update("title", e.target.value)} placeholder={uploadFile?.name.replace(/\.[^.]+$/, "") || "Evening light study"} /></label>
           <label><span>Stage</span><select value={form.stage} onChange={(e) => update("stage", e.target.value)}>{STAGES.map((stage) => <option key={stage}>{stage}</option>)}</select></label>
           <label><span>Style</span><input value={form.style} onChange={(e) => update("style", e.target.value)} placeholder="Painterly fantasy" /></label>
           <label className="full"><span>What are you trying to communicate?</span><textarea rows={4} value={form.intent} onChange={(e) => update("intent", e.target.value)} placeholder="I want the quiet figure to feel small against the city, but still hopeful…" /></label>
         </div>
-        <button className="primary-action" disabled={busy !== null} onClick={onSubmit}>
-          {busy === "upload" ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
-          Clarify my intent <ArrowRight size={17} />
+        <button className="primary-action" disabled={busy !== null} onClick={signedIn ? onSubmit : onRequireSignIn}>
+          {busy === "upload" ? <LoaderCircle className="spin" size={18} /> : signedIn ? <Sparkles size={18} /> : <LogIn size={18} />}
+          {signedIn ? "Clarify my intent" : "Sign in to start"} <ArrowRight size={17} />
         </button>
-        <p className="upload-privacy">Your artwork is stored for your private browser history and is sent to the configured AI provider when you request the visual context check and critique.</p>
+        <p className="upload-privacy">Your artwork is stored in your private account history and is sent to the configured AI provider only when you request a visual check, critique, or revision comparison.</p>
       </section>
 
       <section className="sample-section">
         <div><p className="eyebrow">No artwork ready?</p><h3>Try a public-domain study.</h3></div>
         <div className="sample-grid">
           {samples.map((sample) => (
-            <button key={sample.id} onClick={() => onSample(sample.id)} disabled={busy !== null}>
+            <button key={sample.id} onClick={() => signedIn ? onSample(sample.id) : onRequireSignIn()} disabled={busy !== null}>
               <img src={sample.image_url} alt={sample.title} />
               <span><strong>{sample.title}</strong><small>{sample.artist} · {sample.license}</small></span>
               <ChevronRight size={17} />
             </button>
           ))}
+        </div>
+      </section>
+
+      <section className="privacy-notice" aria-labelledby="privacy-title">
+        <LockKeyhole size={20} />
+        <div>
+          <p className="eyebrow">Privacy at a glance</p>
+          <h3 id="privacy-title">Your work stays attached to your account.</h3>
+          <p>ArtMentor stores your uploads, critique history, feedback, revision comparisons, and daily usage count. Your email and password authentication are handled by Supabase. Images and the intent you provide are sent to the configured AI provider only when you ask for an AI-powered action. You can download a ZIP of your data or permanently delete your account and stored work from the account menu.</p>
         </div>
       </section>
     </div>

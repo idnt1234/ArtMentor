@@ -2,10 +2,13 @@ import { useEffect, useState } from "react";
 import {
   ArrowLeft,
   CheckCircle2,
+  Download,
+  Gauge,
   KeyRound,
   LoaderCircle,
   LogOut,
   Mail,
+  Trash2,
   UserRound,
   X,
 } from "lucide-react";
@@ -22,20 +25,30 @@ interface AuthDialogProps {
   open: boolean;
   mode: AuthMode;
   accountEmail: string | null;
+  dailyAiLimit: number | null;
+  dailyAiRemaining: number | null;
+  deletionEnabled: boolean;
   onModeChange: (mode: AuthMode) => void;
   onClose: () => void;
   onAccountChanged: () => Promise<void>;
   onSignOut: () => Promise<void>;
+  onExport: () => Promise<void>;
+  onDelete: () => Promise<void>;
 }
 
 export default function AuthDialog({
   open,
   mode,
   accountEmail,
+  dailyAiLimit,
+  dailyAiRemaining,
+  deletionEnabled,
   onModeChange,
   onClose,
   onAccountChanged,
   onSignOut,
+  onExport,
+  onDelete,
 }: AuthDialogProps) {
   const [email, setEmail] = useState(accountEmail ?? "");
   const [password, setPassword] = useState("");
@@ -43,6 +56,7 @@ export default function AuthDialog({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [deleteConfirmation, setDeleteConfirmation] = useState("");
 
   useEffect(() => {
     if (!open) return;
@@ -51,6 +65,7 @@ export default function AuthDialog({
     setConfirmation("");
     setError(null);
     setNotice(null);
+    setDeleteConfirmation("");
   }, [open, mode, accountEmail]);
 
   if (!open) return null;
@@ -105,6 +120,35 @@ export default function AuthDialog({
     }
   };
 
+  const exportData = async () => {
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await onExport();
+      setNotice("Your account export is downloading.");
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const deleteData = async () => {
+    if (deleteConfirmation !== "DELETE") return;
+    setBusy(true);
+    setError(null);
+    setNotice(null);
+    try {
+      await onDelete();
+      onClose();
+    } catch (cause) {
+      setError((cause as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const title = {
     signin: "Welcome back.",
     signup: "Keep your work with you.",
@@ -127,11 +171,31 @@ export default function AuthDialog({
           <div className="account-summary">
             <span><Mail size={17} /></span>
             <div><small>Signed in as</small><strong>{accountEmail}</strong></div>
-            <p>Your critique history is now available on every device where you sign in.</p>
+            <p>Your critique history is available on every device where you sign in.</p>
+            {dailyAiLimit !== null && (
+              <div className="account-usage">
+                <Gauge size={16} />
+                <span><strong>{dailyAiRemaining ?? 0} of {dailyAiLimit}</strong><small>AI actions remaining today · resets 00:00 UTC</small></span>
+              </div>
+            )}
+            <button className="auth-secondary" onClick={() => void exportData()} disabled={busy}>
+              {busy ? <LoaderCircle className="spin" size={17} /> : <Download size={17} />}
+              Download my data
+            </button>
             <button className="auth-secondary danger" onClick={signOut} disabled={busy}>
               {busy ? <LoaderCircle className="spin" size={17} /> : <LogOut size={17} />}
               Sign out
             </button>
+            <div className="delete-account">
+              <strong>Delete account</strong>
+              <p>This permanently removes your ArtMentor work and sign-in identity. Download your data first if you want a copy.</p>
+              <label><span>Type DELETE to confirm</span><input value={deleteConfirmation} onChange={(event) => setDeleteConfirmation(event.target.value)} placeholder="DELETE" autoComplete="off" /></label>
+              <button className="auth-secondary danger" onClick={() => void deleteData()} disabled={busy || !deletionEnabled || deleteConfirmation !== "DELETE"}>
+                {busy ? <LoaderCircle className="spin" size={17} /> : <Trash2 size={17} />}
+                Permanently delete account
+              </button>
+              {!deletionEnabled && <small>Deletion is not yet configured on this deployment. Contact the operator.</small>}
+            </div>
           </div>
         ) : (
           <form onSubmit={(event) => { event.preventDefault(); void submit(); }}>

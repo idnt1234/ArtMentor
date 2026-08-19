@@ -403,6 +403,12 @@ class FeedbackResponse(BaseModel):
     verdict: str
 
 
+class AccountDeleteRequest(BaseModel):
+    """Destructive account deletion requires an explicit literal confirmation."""
+
+    confirm: Literal["DELETE"]
+
+
 class ChangeAssessment(BaseModel):
     """修改前后某一维度的状态，以及模型看到的证据。"""
     dimension: DimensionName

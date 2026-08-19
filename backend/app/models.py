@@ -7,9 +7,9 @@ MVP 先把复杂且仍会随 Prompt 演进的结果保存为 JSON，避免频繁
 """
 
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 
-from sqlalchemy import DateTime, ForeignKey, String, Text
+from sqlalchemy import Date, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from .database import Base
@@ -135,3 +135,21 @@ class PoseInspection(Base):
     )
 
     project: Mapped[Project] = relationship(back_populates="pose_inspections")
+
+
+class AccountDailyUsage(Base):
+    """Durable per-account counters used to cap shared AI spending each UTC day."""
+
+    __tablename__ = "account_daily_usage"
+    __table_args__ = (
+        UniqueConstraint("account_user_id", "usage_date", name="uq_account_daily_usage"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    account_user_id: Mapped[str] = mapped_column(String(36), index=True)
+    usage_date: Mapped[date] = mapped_column(Date, index=True)
+    ai_calls: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow, onupdate=utcnow
+    )

@@ -40,9 +40,9 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   const accessCode = sessionStorage.getItem(ACCESS_CODE_KEY);
   if (accessCode) headers.set("X-ArtMentor-Access-Code", accessCode);
-  // Only the account-exchange endpoint sends the Supabase token. FastAPI then
-  // issues a short-lived HttpOnly bridge, avoiding a remote Auth lookup on every API call.
-  if (path === "/session") {
+  // Session exchange and destructive account operations require a fresh Supabase
+  // token. Other private calls use the bounded HttpOnly bridge issued by /session.
+  if (path === "/session" || path.startsWith("/account")) {
     const accessToken = await authAccessToken();
     if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
   }
@@ -72,11 +72,48 @@ export interface SessionStatus {
   access_granted: boolean;
   pose_enabled: boolean;
   auth_enabled: boolean;
+  account_required: boolean;
+  account_deletion_enabled: boolean;
   auth_user_id: string | null;
   auth_email: string | null;
   supabase_url: string | null;
   supabase_publishable_key: string | null;
   claimed_projects: number;
+  daily_ai_limit: number | null;
+  daily_ai_used: number;
+  daily_ai_remaining: number | null;
+}
+
+async function downloadAccountExport(): Promise<void> {
+  const headers = new Headers();
+  const accessCode = sessionStorage.getItem(ACCESS_CODE_KEY);
+  if (accessCode) headers.set("X-ArtMentor-Access-Code", accessCode);
+  const accessToken = await authAccessToken();
+  if (accessToken) headers.set("Authorization", `Bearer ${accessToken}`);
+  const response = await fetch(`${API_ROOT}/account/export`, {
+    credentials: "include",
+    headers,
+  });
+  if (!response.ok) {
+    let message = `Export failed (${response.status})`;
+    try {
+      const body = (await response.json()) as { detail?: string };
+      if (body.detail) message = body.detail;
+    } catch {
+      // Preserve the status-based fallback for non-JSON errors.
+    }
+    throw new Error(message);
+  }
+  const disposition = response.headers.get("Content-Disposition") ?? "";
+  const filename = disposition.match(/filename="([^"]+)"/)?.[1] ?? "ArtMentor-export.zip";
+  const url = URL.createObjectURL(await response.blob());
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
 }
 
 // 页面组件只依赖这个对象，不直接关心 URL、Header、Cookie 和错误解析细节。
@@ -84,6 +121,12 @@ export const api = {
   // 启动与历史：判断门禁状态，读取样例和当前匿名会话的项目。
   session: () => request<SessionStatus>("/session"),
   logoutBridge: () => request<void>("/auth/logout", { method: "POST" }),
+  exportAccount: downloadAccountExport,
+  deleteAccount: () => request<void>("/account", {
+    method: "DELETE",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ confirm: "DELETE" }),
+  }),
   samples: () => request<SampleArtwork[]>("/samples"),
   projects: () => request<Project[]>("/projects"),
   // 项目与意图：先保存作品，再单独复述意图，尚未执行正式视觉点评。

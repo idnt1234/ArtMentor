@@ -6,7 +6,13 @@ import time
 import httpx
 import pytest
 
-from app.auth import AuthServiceUnavailable, InvalidAuthToken, SupabaseAuthVerifier
+from app.auth import (
+    AuthAdminUnavailable,
+    AuthServiceUnavailable,
+    InvalidAuthToken,
+    SupabaseAuthAdmin,
+    SupabaseAuthVerifier,
+)
 from app.config import Settings
 from app.security import signed_account_cookie, valid_account_cookie
 
@@ -88,3 +94,38 @@ def test_account_bridge_cookie_accepts_first_release_format() -> None:
     assert parsed is not None
     assert parsed.user_id == user_id
     assert parsed.email is None
+
+
+def test_supabase_admin_uses_server_secret_for_permanent_user_deletion() -> None:
+    user_id = "11111111-1111-4111-8111-111111111111"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        assert request.url.path == f"/auth/v1/admin/users/{user_id}"
+        assert request.headers["apikey"] == "sb_secret_test"
+        assert request.headers["authorization"] == "Bearer sb_secret_test"
+        assert request.content == b'{"should_soft_delete":false}'
+        return httpx.Response(200, json={"id": user_id})
+
+    settings = Settings(
+        supabase_url="https://project.supabase.co",
+        supabase_secret_key="sb_secret_test",
+    )
+    admin = SupabaseAuthAdmin(settings)
+    original = admin._client
+    admin._client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        base_url="https://project.supabase.co",
+    )
+    if original is not None:
+        asyncio.run(original.aclose())
+    try:
+        asyncio.run(admin.delete_user(user_id))
+    finally:
+        asyncio.run(admin.close())
+
+
+def test_supabase_admin_fails_closed_without_server_secret() -> None:
+    admin = SupabaseAuthAdmin(Settings(supabase_url="https://project.supabase.co"))
+    with pytest.raises(AuthAdminUnavailable):
+        asyncio.run(admin.delete_user("11111111-1111-4111-8111-111111111111"))

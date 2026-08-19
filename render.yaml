@@ -39,10 +39,19 @@ services:
         value: https://xvmyxrwipzlqtljnkkhj.supabase.co
       - key: SUPABASE_PUBLISHABLE_KEY
         sync: false
+      # Server-only; used only after a user confirms permanent account deletion.
+      - key: SUPABASE_SECRET_KEY
+        sync: false
+      - key: REQUIRE_ACCOUNT_FOR_WORK
+        value: "true"
+      - key: ACCOUNT_DAILY_AI_LIMIT
+        value: "5"
       - key: SESSION_SECRET
         generateValue: true
       - key: SESSION_COOKIE_SECURE
         value: "true"
+      - key: ACCOUNT_COOKIE_MAX_AGE
+        value: "604800"
       - key: DEMO_ACCESS_CODE
         sync: false
       - key: MAX_UPLOAD_MB

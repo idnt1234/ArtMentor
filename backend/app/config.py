@@ -36,13 +36,16 @@ class Settings(BaseSettings):
     analysis_max_side: int = 1600
     session_secret: str = "artmentor-local-session-secret"
     session_cookie_secure: bool = False
-    # Supabase Auth is optional locally. The publishable key is intentionally safe
-    # for the browser; service-role and JWT signing secrets are never accepted here.
+    # The publishable key is sent to the browser. The secret key is server-only and
+    # is used exclusively for confirmed self-service account deletion.
     supabase_url: str | None = None
     supabase_publishable_key: str | None = None
+    supabase_secret_key: str | None = None
     # Supabase remains the source of truth; this signed HttpOnly bridge keeps a
     # verified browser session usable when client-side storage is unavailable.
     account_cookie_max_age: int = 60 * 60 * 24 * 7
+    require_account_for_work: bool = True
+    account_daily_ai_limit: int = 5
     demo_access_code: str | None = None
     ai_rate_limit_per_hour: int = 20
     upload_rate_limit_per_hour: int = 10
@@ -85,6 +88,10 @@ class Settings(BaseSettings):
     @property
     def auth_configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_publishable_key)
+
+    @property
+    def auth_admin_configured(self) -> bool:
+        return bool(self.supabase_url and self.supabase_secret_key)
 
     @property
     def resolved_s3_endpoint(self) -> str:

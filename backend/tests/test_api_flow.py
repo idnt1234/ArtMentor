@@ -6,13 +6,18 @@ AI 密钥并启用确定性回退，因此不会访问公网或消耗额度。�
 """
 
 import io
+import json
+import zipfile
 
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
+from sqlalchemy import delete
 
 import app.main as main_module
 from app.auth import AuthUser, InvalidAuthToken
+from app.database import SessionLocal
 from app.main import app, settings
+from app.models import AccountDailyUsage
 from app.security import ACCOUNT_COOKIE
 
 
@@ -344,6 +349,12 @@ class FakeAuthVerifier:
         "account-b": AuthUser(
             id="22222222-2222-4222-8222-222222222222", email="artist-b@example.com"
         ),
+        "account-public": AuthUser(
+            id="33333333-3333-4333-8333-333333333333", email="public@example.com"
+        ),
+        "account-delete": AuthUser(
+            id="44444444-4444-4444-8444-444444444444", email="delete@example.com"
+        ),
     }
 
     async def verify(self, token: str) -> AuthUser:
@@ -365,6 +376,7 @@ def test_account_login_claims_anonymous_projects_and_preserves_media_privacy() -
             try:
                 created = client.post(
                     "/api/projects",
+                    headers={"X-Forwarded-For": "198.51.100.44"},
                     data={
                         "title": "Claim this study",
                         "stage": "Sketch",
@@ -434,5 +446,158 @@ def test_account_login_claims_anonymous_projects_and_preserves_media_privacy() -
             finally:
                 main_module.auth_verifier = real_verifier
     finally:
+        settings.supabase_url = original_url
+        settings.supabase_publishable_key = original_key
+
+
+class FakeAuthAdmin:
+    enabled = True
+
+    def __init__(self) -> None:
+        self.deleted: list[str] = []
+
+    async def delete_user(self, user_id: str) -> None:
+        self.deleted.append(user_id)
+
+
+def test_public_mode_requires_login_and_enforces_durable_daily_quota() -> None:
+    original_required = settings.require_account_for_work
+    original_limit = settings.account_daily_ai_limit
+    original_url = settings.supabase_url
+    original_key = settings.supabase_publishable_key
+    settings.require_account_for_work = True
+    settings.account_daily_ai_limit = 1
+    settings.supabase_url = "https://example.supabase.co"
+    settings.supabase_publishable_key = "sb_publishable_test"
+    try:
+        with TestClient(app) as client:
+            real_verifier = main_module.auth_verifier
+            main_module.auth_verifier = FakeAuthVerifier()  # type: ignore[assignment]
+            try:
+                with SessionLocal() as db:
+                    db.execute(
+                        delete(AccountDailyUsage).where(
+                            AccountDailyUsage.account_user_id
+                            == FakeAuthVerifier.users["account-public"].id
+                        )
+                    )
+                    db.commit()
+                assert client.get("/api/session").status_code == 200
+                assert client.get("/api/samples").status_code == 200
+                assert client.get("/api/projects").status_code == 401
+                blocked = client.post(
+                    "/api/projects",
+                    data={
+                        "stage": "Sketch",
+                        "style": "Digital illustration",
+                        "intent": "This anonymous upload must be rejected by public mode.",
+                    },
+                    files={"image": ("blocked.png", artwork_bytes(), "image/png")},
+                )
+                assert blocked.status_code == 401
+
+                signed_in = client.get(
+                    "/api/session",
+                    headers={"Authorization": "Bearer account-public"},
+                )
+                assert signed_in.status_code == 200
+                assert signed_in.json()["daily_ai_remaining"] == 1
+                created = client.post(
+                    "/api/projects",
+                    data={
+                        "title": "Public account study",
+                        "stage": "Sketch",
+                        "style": "Digital illustration",
+                        "intent": "Test the daily account allowance on a signed-in project.",
+                    },
+                    files={"image": ("public.png", artwork_bytes(), "image/png")},
+                )
+                assert created.status_code == 200, created.text
+                project_id = created.json()["id"]
+                first = client.post(f"/api/projects/{project_id}/intent/restate")
+                assert first.status_code == 200, first.text
+                second = client.post(f"/api/projects/{project_id}/intent/restate")
+                assert second.status_code == 429
+                status = client.get("/api/session").json()
+                assert status["daily_ai_used"] == 1
+                assert status["daily_ai_remaining"] == 0
+            finally:
+                main_module.auth_verifier = real_verifier
+    finally:
+        settings.require_account_for_work = original_required
+        settings.account_daily_ai_limit = original_limit
+        settings.supabase_url = original_url
+        settings.supabase_publishable_key = original_key
+
+
+def test_account_export_and_confirmed_deletion_remove_owned_data() -> None:
+    original_required = settings.require_account_for_work
+    original_url = settings.supabase_url
+    original_key = settings.supabase_publishable_key
+    settings.require_account_for_work = True
+    settings.supabase_url = "https://example.supabase.co"
+    settings.supabase_publishable_key = "sb_publishable_test"
+    try:
+        with TestClient(app) as client:
+            real_verifier = main_module.auth_verifier
+            real_admin = main_module.auth_admin
+            fake_admin = FakeAuthAdmin()
+            main_module.auth_verifier = FakeAuthVerifier()  # type: ignore[assignment]
+            main_module.auth_admin = fake_admin  # type: ignore[assignment]
+            try:
+                client.get(
+                    "/api/session",
+                    headers={"Authorization": "Bearer account-delete"},
+                )
+                created = client.post(
+                    "/api/projects",
+                    headers={"X-Forwarded-For": "198.51.100.45"},
+                    data={
+                        "title": "Export before delete",
+                        "stage": "Sketch",
+                        "style": "Digital illustration",
+                        "intent": "Export this private artwork before deleting the account.",
+                    },
+                    files={"image": ("delete.png", artwork_bytes(), "image/png")},
+                )
+                assert created.status_code == 200, created.text
+                project = created.json()
+
+                exported = client.get(
+                    "/api/account/export",
+                    headers={"Authorization": "Bearer account-delete"},
+                )
+                assert exported.status_code == 200, exported.text
+                with zipfile.ZipFile(io.BytesIO(exported.content)) as bundle:
+                    assert "account.json" in bundle.namelist()
+                    manifest = json.loads(bundle.read("account.json"))
+                    assert manifest["account"]["email"] == "delete@example.com"
+                    assert project["id"] in {item["id"] for item in manifest["projects"]}
+                    assert any(name.startswith("images/projects/") for name in bundle.namelist())
+
+                cookie_only = client.request(
+                    "DELETE", "/api/account", json={"confirm": "DELETE"}
+                )
+                assert cookie_only.status_code == 401
+                deleted = client.request(
+                    "DELETE",
+                    "/api/account",
+                    headers={"Authorization": "Bearer account-delete"},
+                    json={"confirm": "DELETE"},
+                )
+                assert deleted.status_code == 204, deleted.text
+                assert fake_admin.deleted == [FakeAuthVerifier.users["account-delete"].id]
+
+                client.get(
+                    "/api/session",
+                    headers={"Authorization": "Bearer account-delete"},
+                )
+                assert client.get("/api/projects").json() == []
+                assert client.get(project["image_url"]).status_code == 404
+            finally:
+                main_module.auth_verifier = real_verifier
+                main_module.auth_admin = real_admin
+    finally:
+        settings.require_account_for_work = original_required
         settings.supabase_url = original_url
         settings.supabase_publishable_key = original_key

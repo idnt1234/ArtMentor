@@ -16,6 +16,8 @@ class BlobStorage(Protocol):
 
     def content_type(self, key: str) -> str: ...
 
+    def delete(self, key: str) -> None: ...
+
 
 class LocalBlobStorage:
     def __init__(self, root: str) -> None:
@@ -34,6 +36,10 @@ class LocalBlobStorage:
 
     def content_type(self, key: str) -> str:
         return mimetypes.guess_type(key)[0] or "application/octet-stream"
+
+    def delete(self, key: str) -> None:
+        safe_key = Path(key).name
+        (self.root / safe_key).unlink(missing_ok=True)
 
 
 class S3BlobStorage:
@@ -70,6 +76,9 @@ class S3BlobStorage:
 
     def content_type(self, key: str) -> str:
         return mimetypes.guess_type(key)[0] or "application/octet-stream"
+
+    def delete(self, key: str) -> None:
+        self.client.delete_object(Bucket=self.bucket, Key=Path(key).name)
 
 
 def build_storage(settings: Settings) -> BlobStorage:

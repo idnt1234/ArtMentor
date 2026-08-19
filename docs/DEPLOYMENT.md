@@ -10,6 +10,7 @@ This production path keeps the public application in one Render Docker web servi
 4. In Storage S3 settings, create an S3 access key and note the endpoint, region, access key ID, and secret access key.
 5. In Authentication providers, keep Email enabled, allow new sign-ups, and keep Confirm Email enabled.
 6. In Authentication URL Configuration, set Site URL to the exact Render HTTPS origin. Add that same origin and `http://localhost:5173/**` to Redirect URLs.
+7. In Project Settings → API Keys, create/copy a server secret key for the deletion endpoint. Do not use this key in the browser.
 
 Do not commit any copied value. ArtMentor accepts Supabase's normal `postgresql://...` URL and switches it to the installed psycopg 3 driver internally.
 
@@ -36,6 +37,7 @@ Enter these only in Render's Blueprint secret prompts:
 | `S3_ACCESS_KEY` | Supabase Storage S3 access key ID |
 | `S3_SECRET_KEY` | Supabase Storage S3 secret access key |
 | `SUPABASE_PUBLISHABLE_KEY` | Supabase project's browser-safe publishable key (`sb_publishable_...`); never use a secret/service-role key |
+| `SUPABASE_SECRET_KEY` | Supabase server secret (`sb_secret_...`) used only for confirmed self-service Auth deletion; never expose it to the frontend |
 | `GPTSAPI_KEY` | WildAI / GPTsAPI key |
 | `DEMO_ACCESS_CODE` | A code shared only with reviewers and testers |
 | `POSE_WORKER_URL` | Private GPU worker HTTPS base address, without `/health` |
@@ -56,6 +58,9 @@ The checked-in `render.yaml` supplies these non-secret variables:
 | `S3_AUTO_CREATE_BUCKET` | `false` |
 | `SUPABASE_URL` | Supabase project URL, supplied by the Blueprint for the current project |
 | `SESSION_COOKIE_SECURE` | `true` |
+| `ACCOUNT_COOKIE_MAX_AGE` | `604800` (seven days) |
+| `REQUIRE_ACCOUNT_FOR_WORK` | `true` |
+| `ACCOUNT_DAILY_AI_LIMIT` | `5` paid AI actions per account per UTC day |
 | `MAX_UPLOAD_MB` | `10` |
 | `ANALYSIS_MAX_SIDE` | `1600` |
 | `AI_RATE_LIMIT_PER_HOUR` | `12` |
@@ -65,15 +70,30 @@ The checked-in `render.yaml` supplies these non-secret variables:
 | `POSE_PROVIDER` | `worker` |
 | `POSE_WORKER_TIMEOUT_SECONDS` | `45` |
 
-The access code is optional in code, but required by this Blueprint prompt and strongly recommended because every successful critique spends a shared third-party API allowance.
+Keep the access code during staged validation. After all public-mode checks pass,
+clear `DEMO_ACCESS_CODE` in Render and redeploy. The homepage, public samples, and
+account screens then become public, while uploads, project history, private media,
+and AI actions still require a verified account. Cost protection comes from both
+the durable account-day allowance and the existing IP sliding-window limits.
 
 ### Enable account email delivery
 
-The first version supports email/password sign-up, confirmation, sign-in,
-sign-out, and password reset. Supabase's default SMTP is only suitable for
-testing with organization-team addresses and is heavily rate-limited. Before
-allowing public registration, configure a custom SMTP provider in Supabase
-Authentication settings. Keep the demo access code enabled while testing.
+Supabase's built-in mail service is for initial testing, not public production:
+delivery is restricted and its quota is very low. Before clearing the access code:
+
+1. Create an account with a transactional email provider and verify a sending
+   domain or subdomain.
+2. Add the provider's SPF and DKIM DNS records, and publish a DMARC policy for
+   that sending domain.
+3. In Supabase Authentication → SMTP Settings, enable custom SMTP and enter the
+   provider's host, port, username, password, sender address, and sender name.
+4. Send confirmation and password-reset messages to at least two unrelated mail
+   providers, follow the links, and verify that both return to the production site.
+5. Review Supabase Auth email and sign-up rate limits. Enable CAPTCHA before broad
+   promotion if automated registrations are a concern.
+
+SMTP credentials belong only in the Supabase dashboard. They are not Render
+variables and must never be committed to this repository.
 
 The browser receives only `SUPABASE_URL` and `SUPABASE_PUBLISHABLE_KEY`. S3
 credentials, database credentials, Supabase secret/service-role keys, and JWT
@@ -102,21 +122,24 @@ not affect the normal critique flow or already saved, user-corrected skeletons.
 After Render reports **Live**:
 
 1. Open `/api/health` and confirm `status` is `ok`, `storage` is `s3`, and `ai_configured` is `true`.
-2. Open the root URL in a private browser window and confirm the access gate appears.
-3. Import one public-domain sample, run a critique, refresh the page, and confirm it remains in Recent work.
-4. Open a second private browser profile and confirm the first profile's project is not listed and its media URL returns 404.
+2. While `DEMO_ACCESS_CODE` is set, open the root URL in a private browser window and confirm the access gate appears.
+3. Sign in, import one public-domain sample, run a critique, refresh the page, and confirm it remains in Recent work.
+4. Sign out and confirm project history, upload, sample import, AI APIs, and private media are unavailable, while `/api/session`, `/api/samples`, sign-up, and sign-in remain available.
 5. Upload a revision and confirm the before/after report survives a Render restart.
 6. When pose is enabled, estimate one artwork skeleton, correct a point, save it,
    run the 2D check, refresh the page, and confirm the corrected skeleton remains.
-7. Create an anonymous project, register and confirm a test account, then sign in. Confirm the project remains visible after clearing site data and signing in from a second browser profile.
-8. Sign out and confirm the account project and its direct `/api/media/...` URL are no longer readable. Request a password reset and confirm the email returns to the Render site with the new-password dialog.
+7. Download the account export and inspect `account.json` plus the included image folders.
+8. In a disposable account, type `DELETE`, permanently delete it, and confirm the old credentials no longer sign in and its media URL no longer resolves.
+9. Exhaust the configured daily allowance in a test account and confirm the next AI action returns `429` while upload/history access still works.
+10. Request a password reset and confirm the custom-SMTP email returns to the Render site with the new-password dialog.
+11. Clear `DEMO_ACCESS_CODE`, redeploy, and repeat steps 3–10 from a clean profile before announcing the public URL.
 
 ## Privacy and operational limits
 
-- The anonymous HttpOnly cookie separates visitors without collecting an email or username. Anonymous use remains available when Auth is disabled or the visitor chooses not to register.
-- A verified account can claim the current browser's anonymous history and recover it on another device. Clearing the anonymous cookie before the first login still makes that unclaimed history inaccessible.
-- Self-service account/data deletion is not included in this first version and must be added before presenting the service as a complete public account lifecycle.
+- Public browsing does not grant a private workspace. With `REQUIRE_ACCOUNT_FOR_WORK=true`, project and media APIs require a verified account even after the access code is removed.
+- A verified account can still claim old browser history created before the public account requirement was enabled.
+- Self-service ZIP export and permanent account/data deletion are available in the account dialog. Deletion requires `SUPABASE_SECRET_KEY` on the server and a fresh verified user token.
 - Uploaded images are private application objects, but they are sent to the configured vision provider for the requested visual context check and again for the confirmed critique.
-- Rate limits are in memory and reset when the service restarts. The access code is the main cost-control boundary for this MVP.
+- Per-account daily AI usage is durable in PostgreSQL. IP upload/AI windows remain in memory and reset with the web process; Supabase separately enforces Auth endpoint limits.
 - Render's local filesystem is not used for production data, so sleep or rebuild does not remove Supabase records or images.
 - A free Render service sleeps after 15 minutes without inbound traffic. Its first request after sleep can take about a minute while the container starts.

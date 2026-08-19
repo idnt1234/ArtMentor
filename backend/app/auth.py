@@ -28,6 +28,10 @@ class AuthServiceUnavailable(Exception):
     """Supabase Auth could not be reached, so the request must fail closed."""
 
 
+class AuthAdminUnavailable(Exception):
+    """Server-side account administration is missing or temporarily unavailable."""
+
+
 class SupabaseAuthVerifier:
     def __init__(self, settings: Settings) -> None:
         self.enabled = settings.auth_configured
@@ -69,3 +73,47 @@ class SupabaseAuthVerifier:
             raise AuthServiceUnavailable("The account service returned an invalid response.") from exc
         # account_owner_id performs strict UUID validation before this value reaches a query.
         return AuthUser(id=user_id, email=email if isinstance(email, str) else None)
+
+
+class SupabaseAuthAdmin:
+    """Minimal server-only client for permanently deleting the current Auth user."""
+
+    def __init__(self, settings: Settings) -> None:
+        self.enabled = settings.auth_admin_configured
+        self._secret_key = settings.supabase_secret_key or ""
+        self._client = (
+            httpx.AsyncClient(
+                base_url=(settings.supabase_url or "").rstrip("/"),
+                timeout=httpx.Timeout(8.0),
+            )
+            if self.enabled
+            else None
+        )
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+
+    async def delete_user(self, user_id: str) -> None:
+        if not self.enabled or self._client is None:
+            raise AuthAdminUnavailable(
+                "Account deletion is not configured. Contact the site operator."
+            )
+        try:
+            response = await self._client.request(
+                "DELETE",
+                f"/auth/v1/admin/users/{uuid.UUID(user_id)}",
+                headers={
+                    "apikey": self._secret_key,
+                    "Authorization": f"Bearer {self._secret_key}",
+                },
+                json={"should_soft_delete": False},
+            )
+        except (httpx.RequestError, ValueError) as exc:
+            raise AuthAdminUnavailable(
+                "Account deletion is temporarily unavailable. Please try again."
+            ) from exc
+        if response.status_code not in {200, 204}:
+            raise AuthAdminUnavailable(
+                "The account service could not delete this account. Please try again."
+            )

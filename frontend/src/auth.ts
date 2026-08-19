@@ -91,3 +91,8 @@ export async function signOutAccount(): Promise<void> {
   const { error } = await requireClient().auth.signOut();
   if (error) throw error;
 }
+
+export async function clearDeletedAccountSession(): Promise<void> {
+  const { error } = await requireClient().auth.signOut({ scope: "local" });
+  if (error && !error.message.toLowerCase().includes("session missing")) throw error;
+}
