@@ -52,8 +52,6 @@ services:
         value: "true"
       - key: ACCOUNT_COOKIE_MAX_AGE
         value: "604800"
-      - key: DEMO_ACCESS_CODE
-        sync: false
       - key: MAX_UPLOAD_MB
         value: "10"
       - key: ANALYSIS_MAX_SIDE
