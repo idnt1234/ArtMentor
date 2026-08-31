@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import {
   AlertTriangle,
+  Box,
   Check,
   LoaderCircle,
   RefreshCw,
@@ -10,6 +11,7 @@ import {
 import { api, assetUrl } from "../api";
 import type {
   PoseInspection,
+  Pose3DReconstruction,
   PoseSkeleton,
   PoseStyleMode,
   Project,
@@ -22,6 +24,7 @@ const pendingLoads = new Map<string, Promise<PoseInspection>>();
 
 interface Props {
   project: Project;
+  pose3dEnabled: boolean;
   onError: (message: string) => void;
 }
 
@@ -39,14 +42,15 @@ function loadOrEstimate(projectId: string): Promise<PoseInspection> {
   return request;
 }
 
-export default function ArtworkPosePanel({ project, onError }: Props) {
+export default function ArtworkPosePanel({ project, pose3dEnabled, onError }: Props) {
   const [inspection, setInspection] = useState<PoseInspection | null>(null);
+  const [preview3d, setPreview3d] = useState<Pose3DReconstruction | null>(null);
   const [skeleton, setSkeleton] = useState<PoseSkeleton | null>(null);
   const [bbox, setBbox] = useState<Rect>(INITIAL_BOX);
   const [styleMode, setStyleMode] =
     useState<PoseStyleMode>("semi_realistic");
   const [busy, setBusy] =
-    useState<"load" | "estimate" | "save" | "check" | null>("load");
+    useState<"load" | "estimate" | "save" | "check" | "pose3d" | null>("load");
 
   const sync = (next: PoseInspection) => {
     setInspection(next);
@@ -75,6 +79,24 @@ export default function ArtworkPosePanel({ project, onError }: Props) {
     };
   }, [project.id, onError]);
 
+  useEffect(() => {
+    if (!pose3dEnabled) {
+      setPreview3d(null);
+      return;
+    }
+    let active = true;
+    api.latestPose3D(project.id)
+      .then((saved) => {
+        if (active) setPreview3d(saved);
+      })
+      .catch((cause: Error) => {
+        if (active) onError(cause.message);
+      });
+    return () => {
+      active = false;
+    };
+  }, [project.id, pose3dEnabled, onError]);
+
   const highlighted = useMemo(
     () =>
       new Set(
@@ -87,6 +109,7 @@ export default function ArtworkPosePanel({ project, onError }: Props) {
 
   const updateSkeleton = (next: PoseSkeleton) => {
     setSkeleton(next);
+    setPreview3d((current) => current ? { ...current, stale: true } : current);
     setInspection((current) =>
       current ? { ...current, status: "estimated", result: null } : current,
     );
@@ -148,6 +171,18 @@ export default function ArtworkPosePanel({ project, onError }: Props) {
     }
     try {
       sync(await api.checkPoseInspection(project.id));
+    } catch (cause) {
+      onError((cause as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const reconstruct3d = async () => {
+    if (!skeleton?.confirmed) return;
+    setBusy("pose3d");
+    try {
+      setPreview3d(await api.reconstructPose3D(project.id));
     } catch (cause) {
       onError((cause as Error).message);
     } finally {
@@ -356,6 +391,102 @@ export default function ArtworkPosePanel({ project, onError }: Props) {
             ))}
           </details>
         </div>
+      )}
+
+      {pose3dEnabled && skeleton && (
+        <section className="pose3d-preview">
+          <header>
+            <div className="pose3d-mark"><Box size={19} /></div>
+            <div>
+              <p className="eyebrow">Private research beta</p>
+              <h2>Single-image 3D hypothesis</h2>
+              <p>
+                SAM 3D Body turns the confirmed 2D evidence into one possible
+                mesh. Side and top views reveal depth assumptions that the
+                original image cannot verify.
+              </p>
+            </div>
+            <button
+              type="button"
+              className="primary-action"
+              disabled={busy !== null || !skeleton.confirmed}
+              onClick={reconstruct3d}
+            >
+              {busy === "pose3d" ? (
+                <LoaderCircle className="spin" size={17} />
+              ) : (
+                <Box size={16} />
+              )}
+              {preview3d ? "Regenerate from current skeleton" : "Generate 3D preview"}
+            </button>
+          </header>
+
+          {!skeleton.confirmed && (
+            <div className="pose3d-gate">
+              Confirm the editable 2D skeleton first. The 3D worker never runs
+              from unreviewed model points.
+            </div>
+          )}
+
+          {preview3d && (
+            <>
+              {preview3d.stale && (
+                <div className="pose3d-stale">
+                  <AlertTriangle size={15} /> This preview belongs to an older
+                  skeleton. Confirm your edits and regenerate it.
+                </div>
+              )}
+              <div className="pose3d-view-grid">
+                <figure className="pose3d-overlay">
+                  <img src={assetUrl(preview3d.overlay_image_url)} alt="Confirmed 2D points compared with the projected 3D hypothesis" />
+                  <figcaption>2D evidence overlay</figcaption>
+                </figure>
+                <figure>
+                  <img src={assetUrl(preview3d.camera_image_url)} alt="Camera view of the reconstructed 3D mesh" />
+                  <figcaption>Camera view</figcaption>
+                </figure>
+                <figure>
+                  <img src={assetUrl(preview3d.side_image_url)} alt="Side view of the reconstructed 3D mesh" />
+                  <figcaption>Side hypothesis</figcaption>
+                </figure>
+                <figure>
+                  <img src={assetUrl(preview3d.top_image_url)} alt="Top view of the reconstructed 3D mesh" />
+                  <figcaption>Top hypothesis</figcaption>
+                </figure>
+              </div>
+              <div className="pose3d-evidence">
+                <div>
+                  <span>2D projection error</span>
+                  <strong>
+                    {preview3d.result.metrics.mean_projection_error_normalized == null
+                      ? "insufficient evidence"
+                      : `${(preview3d.result.metrics.mean_projection_error_normalized * 100).toFixed(2)}% of person-box diagonal`}
+                  </strong>
+                </div>
+                <div>
+                  <span>Reviewed joints</span>
+                  <strong>{preview3d.result.metrics.reviewed_keypoint_count} / 17</strong>
+                </div>
+                <div>
+                  <span>2D prompts used</span>
+                  <strong>
+                    {preview3d.result.prompted_joints.length
+                      ? preview3d.result.prompted_joints.map((name) => name.replaceAll("_", " ")).join(", ")
+                      : "box only"}
+                  </strong>
+                </div>
+                <div>
+                  <span>GPU inference</span>
+                  <strong>{preview3d.result.inference_seconds.toFixed(2)} s</strong>
+                </div>
+              </div>
+              <details className="pose3d-limits" open>
+                <summary>What this preview can and cannot say</summary>
+                {preview3d.result.limitations.map((limit) => <p key={limit}>• {limit}</p>)}
+              </details>
+            </>
+          )}
+        </section>
       )}
     </section>
   );

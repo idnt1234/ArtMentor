@@ -6,10 +6,11 @@ import PoseComparisonPanel from "./PoseComparisonPanel";
 
 interface Props {
   project: Project;
+  pose3dEnabled: boolean;
   onError: (message: string) => void;
 }
 
-export default function BodyCheckPanel({ project, onError }: Props) {
+export default function BodyCheckPanel({ project, pose3dEnabled, onError }: Props) {
   const [mode, setMode] = useState<"artwork" | "reference">("artwork");
 
   return (
@@ -35,7 +36,11 @@ export default function BodyCheckPanel({ project, onError }: Props) {
         </button>
       </nav>
       {mode === "artwork" ? (
-        <ArtworkPosePanel project={project} onError={onError} />
+        <ArtworkPosePanel
+          project={project}
+          pose3dEnabled={pose3dEnabled}
+          onError={onError}
+        />
       ) : (
         <PoseComparisonPanel project={project} onError={onError} />
       )}

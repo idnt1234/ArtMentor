@@ -56,6 +56,13 @@ class Settings(BaseSettings):
     pose_worker_url: str = "http://127.0.0.1:8011"
     pose_worker_token: str | None = None
     pose_worker_timeout_seconds: float = 45.0
+    # 单图 3D 重建是受控研究预览：默认关闭，并且只向明确列出的账户开放。
+    # 它使用独立的 Python 3.11/CUDA Worker，不与 RTMPose 进程混装。
+    pose3d_feature_enabled: bool = False
+    pose3d_allowed_emails: str = ""
+    pose3d_worker_url: str = "http://127.0.0.1:8012"
+    pose3d_worker_token: str | None = None
+    pose3d_worker_timeout_seconds: float = 180.0
 
     model_config = SettingsConfigDict(
         env_file=("../.env", ".env"), env_file_encoding="utf-8", extra="ignore"
@@ -92,6 +99,15 @@ class Settings(BaseSettings):
     @property
     def auth_admin_configured(self) -> bool:
         return bool(self.supabase_url and self.supabase_secret_key)
+
+    @property
+    def pose3d_email_allowlist(self) -> set[str]:
+        """Return a normalized, explicit allowlist; an empty value enables nobody."""
+        return {
+            email.strip().casefold()
+            for email in self.pose3d_allowed_emails.split(",")
+            if email.strip()
+        }
 
     @property
     def resolved_s3_endpoint(self) -> str:

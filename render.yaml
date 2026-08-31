@@ -73,3 +73,15 @@ services:
         sync: false
       - key: POSE_WORKER_TIMEOUT_SECONDS
         value: "45"
+      # Single-image 3D is a private research beta. Enabling the flag alone is
+      # insufficient: the signed-in email must also be explicitly allowlisted.
+      - key: POSE3D_FEATURE_ENABLED
+        value: "false"
+      - key: POSE3D_ALLOWED_EMAILS
+        sync: false
+      - key: POSE3D_WORKER_URL
+        sync: false
+      - key: POSE3D_WORKER_TOKEN
+        sync: false
+      - key: POSE3D_WORKER_TIMEOUT_SECONDS
+        value: "180"

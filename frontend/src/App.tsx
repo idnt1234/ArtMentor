@@ -121,6 +121,7 @@ function App() {
   const [accessBusy, setAccessBusy] = useState(false);
   // 后端部署开关决定是否展示GPU人体功能；未配置Worker时不显示失效入口。
   const [poseEnabled, setPoseEnabled] = useState(false);
+  const [pose3dEnabled, setPose3dEnabled] = useState(false);
   // Supabase 负责可恢复账户；公开主页可匿名浏览，创作工作区需要登录。
   const [authEnabled, setAuthEnabled] = useState(false);
   const [accountEmail, setAccountEmail] = useState<string | null>(null);
@@ -143,6 +144,7 @@ function App() {
 
   const applySessionStatus = useCallback((session: Awaited<ReturnType<typeof api.session>>) => {
     setPoseEnabled(session.pose_enabled);
+    setPose3dEnabled(session.pose3d_enabled);
     setAuthEnabled(session.auth_enabled);
     setAccountDeletionEnabled(session.account_deletion_enabled);
     setDailyAiLimit(session.daily_ai_limit);
@@ -618,7 +620,11 @@ function App() {
               {poseEnabled && tab === "pose" && (
                 <div className="panel-scroll pose-scroll">
                   <Suspense fallback={<div className="pose-loading"><LoaderCircle className="spin" size={22} /> Loading body-check workspace…</div>}>
-                    <BodyCheckPanel project={project} onError={setError} />
+                    <BodyCheckPanel
+                      project={project}
+                      pose3dEnabled={pose3dEnabled}
+                      onError={setError}
+                    />
                   </Suspense>
                 </div>
               )}

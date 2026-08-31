@@ -214,3 +214,29 @@ export interface PoseInspection {
   created_at: string;
   updated_at: string;
 }
+
+export interface Pose3DReconstruction {
+  id: string;
+  project_id: string;
+  pose_inspection_id: string;
+  status: "completed";
+  model: string;
+  skeleton_sha256: string;
+  stale: boolean;
+  overlay_image_url: string;
+  camera_image_url: string;
+  side_image_url: string;
+  top_image_url: string;
+  result: {
+    metrics: {
+      bbox_diagonal_px: number;
+      reviewed_keypoint_count: number;
+      mean_projection_error_px?: number | null;
+      mean_projection_error_normalized?: number | null;
+    };
+    prompted_joints: string[];
+    inference_seconds: number;
+    limitations: string[];
+  };
+  created_at: string;
+}

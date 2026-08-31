@@ -9,6 +9,7 @@ main.py 只负责安排调用顺序和处理接口错误。
 """
 
 import hmac
+import hashlib
 import io
 import json
 import uuid
@@ -21,7 +22,7 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Upload
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, inspect as sa_inspect, select, update
+from sqlalchemy import delete, inspect as sa_inspect, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -38,6 +39,7 @@ from .models import (
     Analysis,
     AccountDailyUsage,
     Feedback,
+    Pose3DReconstruction,
     PoseComparison,
     PoseInspection,
     Project,
@@ -55,6 +57,8 @@ from .schemas import (
     IntentRestatement,
     PoseComparisonResponse,
     PoseComparisonResult,
+    Pose3DReconstructionResponse,
+    Pose3DResult,
     PoseEstimateRequest,
     PoseInspectionEstimateRequest,
     PoseInspectionResponse,
@@ -75,6 +79,7 @@ from .services.image_metrics import (
 )
 from .services.references import sample_by_id, samples, select_references
 from .services.pose_client import PoseClient, PoseClientError, build_pose_client
+from .services.pose3d_client import Pose3DClient, Pose3DClientError
 from .services.pose_compare import compare_skeletons
 from .services.pose_inspect import inspect_skeleton
 from .services.storage import BlobStorage, build_storage
@@ -96,6 +101,7 @@ settings = get_settings()
 storage: BlobStorage | None = None
 ai: ArtMentorAI | None = None
 pose_client: PoseClient | None = None
+pose3d_client: Pose3DClient | None = None
 auth_verifier: SupabaseAuthVerifier | None = None
 auth_admin: SupabaseAuthAdmin | None = None
 ai_guard = AIGuard(settings)
@@ -104,13 +110,14 @@ ai_guard = AIGuard(settings)
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     """应用启动时建表/迁移，并初始化对象存储和 AI 客户端。"""
-    global storage, ai, pose_client, auth_verifier, auth_admin
+    global storage, ai, pose_client, pose3d_client, auth_verifier, auth_admin
     settings.ensure_local_dirs()
     Base.metadata.create_all(bind=engine)
     migrate_database()
     storage = build_storage(settings)
     ai = ArtMentorAI(settings)
     pose_client = build_pose_client(settings)
+    pose3d_client = Pose3DClient(settings)
     auth_verifier = SupabaseAuthVerifier(settings)
     auth_admin = SupabaseAuthAdmin(settings)
     yield
@@ -297,6 +304,36 @@ def _pose_client() -> PoseClient:
     if pose_client is None:
         raise HTTPException(503, "Pose service is still starting.")
     return pose_client
+
+
+def _pose3d_allowed(request: Request) -> bool:
+    """3D preview is intentionally restricted to explicitly allowlisted accounts."""
+    email = (getattr(request.state, "auth_email", None) or "").strip().casefold()
+    return bool(
+        settings.pose3d_feature_enabled
+        and email
+        and email in settings.pose3d_email_allowlist
+    )
+
+
+def _pose3d_client(request: Request) -> Pose3DClient:
+    if not settings.pose3d_feature_enabled:
+        raise HTTPException(404, "3D research preview is not enabled.")
+    if not _pose3d_allowed(request):
+        raise HTTPException(403, "This account is not in the 3D research preview.")
+    if pose3d_client is None:
+        raise HTTPException(503, "3D research service is still starting.")
+    return pose3d_client
+
+
+def _skeleton_sha256(skeleton: PoseSkeleton) -> str:
+    canonical = json.dumps(
+        skeleton.model_dump(mode="json"),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _media_url(key: str) -> str:
@@ -498,6 +535,32 @@ def _pose_inspection_response(
     )
 
 
+def _pose3d_response(
+    reconstruction: Pose3DReconstruction,
+    current_skeleton: PoseSkeleton | None,
+) -> Pose3DReconstructionResponse:
+    """Restore one immutable research preview and mark it stale after 2D edits."""
+    current_hash = _skeleton_sha256(current_skeleton) if current_skeleton else None
+    return Pose3DReconstructionResponse(
+        id=reconstruction.id,
+        project_id=reconstruction.project_id,
+        pose_inspection_id=reconstruction.pose_inspection_id,
+        status="completed",
+        model=reconstruction.model,
+        skeleton_sha256=reconstruction.skeleton_sha256,
+        stale=(
+            current_hash is not None
+            and current_hash != reconstruction.skeleton_sha256
+        ),
+        overlay_image_url=_media_url(reconstruction.overlay_image_key),
+        camera_image_url=_media_url(reconstruction.camera_image_key),
+        side_image_url=_media_url(reconstruction.side_image_key),
+        top_image_url=_media_url(reconstruction.top_image_key),
+        result=Pose3DResult.model_validate_json(reconstruction.result_json),
+        created_at=reconstruction.created_at,
+    )
+
+
 # ------------------------- 健康检查、会话与图片资源 -------------------------
 
 @app.get(f"{settings.api_prefix}/health")
@@ -515,6 +578,8 @@ def health() -> dict:
         "account_deletion_enabled": settings.auth_admin_configured,
         "pose_enabled": settings.pose_feature_enabled,
         "pose_provider": settings.pose_provider,
+        "pose3d_configured": settings.pose3d_feature_enabled,
+        "pose3d_restricted": True,
     }
 
 
@@ -547,6 +612,7 @@ def session_ready(request: Request, db: Session = Depends(get_db)) -> dict[str, 
         "access_granted": bool(request.state.access_granted),
         # 前端据此隐藏未部署的GPU功能，避免展示一个必定503的入口。
         "pose_enabled": settings.pose_feature_enabled,
+        "pose3d_enabled": _pose3d_allowed(request),
         "auth_enabled": settings.auth_configured,
         "account_required": settings.require_account_for_work,
         "account_deletion_enabled": settings.auth_admin_configured,
@@ -620,6 +686,17 @@ def export_account_data(
         if project_ids
         else []
     )
+    pose3d_reconstructions = (
+        list(
+            db.scalars(
+                select(Pose3DReconstruction).where(
+                    Pose3DReconstruction.project_id.in_(project_ids)
+                )
+            ).all()
+        )
+        if project_ids
+        else []
+    )
     usage = list(
         db.scalars(
             select(AccountDailyUsage).where(
@@ -628,7 +705,7 @@ def export_account_data(
         ).all()
     )
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
         "exported_at": datetime.now(timezone.utc).isoformat(),
         "account": {
             "id": account_user_id,
@@ -640,6 +717,9 @@ def export_account_data(
         "revisions": [_export_record(item) for item in revisions],
         "pose_comparisons": [_export_record(item) for item in pose_comparisons],
         "pose_inspections": [_export_record(item) for item in pose_inspections],
+        "pose3d_reconstructions": [
+            _export_record(item) for item in pose3d_reconstructions
+        ],
         "daily_usage": [_export_record(item) for item in usage],
     }
     archive = io.BytesIO()
@@ -668,6 +748,19 @@ def export_account_data(
                     f"images/projects/{comparison.project_id}/pose-references/{comparison.id}{suffix}",
                     blobs.read(comparison.reference_image_key),
                 )
+            for reconstruction in pose3d_reconstructions:
+                views = {
+                    "overlay": reconstruction.overlay_image_key,
+                    "camera": reconstruction.camera_image_key,
+                    "side": reconstruction.side_image_key,
+                    "top": reconstruction.top_image_key,
+                }
+                for view_name, key in views.items():
+                    suffix = Path(key).suffix or ".bin"
+                    bundle.writestr(
+                        f"images/projects/{reconstruction.project_id}/pose3d/{reconstruction.id}-{view_name}{suffix}",
+                        blobs.read(key),
+                    )
     except Exception as exc:
         raise HTTPException(502, "Could not assemble the account export.") from exc
     archive.seek(0)
@@ -719,9 +812,29 @@ async def delete_account(
         if project_ids
         else []
     )
+    pose3d_reconstructions = (
+        list(
+            db.scalars(
+                select(Pose3DReconstruction).where(
+                    Pose3DReconstruction.project_id.in_(project_ids)
+                )
+            ).all()
+        )
+        if project_ids
+        else []
+    )
     keys = [project.image_key for project in projects]
     keys.extend(revision.image_key for revision in revisions)
     keys.extend(item.reference_image_key for item in pose_comparisons)
+    for item in pose3d_reconstructions:
+        keys.extend(
+            (
+                item.overlay_image_key,
+                item.camera_image_key,
+                item.side_image_key,
+                item.top_image_key,
+            )
+        )
     try:
         for key in set(keys):
             _storage().delete(key)
@@ -732,6 +845,11 @@ async def delete_account(
     if analysis_ids:
         db.execute(delete(Feedback).where(Feedback.analysis_id.in_(analysis_ids)))
     if project_ids:
+        db.execute(
+            delete(Pose3DReconstruction).where(
+                Pose3DReconstruction.project_id.in_(project_ids)
+            )
+        )
         db.execute(delete(PoseInspection).where(PoseInspection.project_id.in_(project_ids)))
         db.execute(delete(PoseComparison).where(PoseComparison.project_id.in_(project_ids)))
         db.execute(delete(Revision).where(Revision.project_id.in_(project_ids)))
@@ -780,7 +898,25 @@ def media(
             Project.owner_id == owner_id,
         )
     )
-    if not owns_original and not owns_revision and not owns_pose_reference:
+    owns_pose3d_view = db.scalar(
+        select(Pose3DReconstruction.id)
+        .join(Project, Pose3DReconstruction.project_id == Project.id)
+        .where(
+            or_(
+                Pose3DReconstruction.overlay_image_key == safe_key,
+                Pose3DReconstruction.camera_image_key == safe_key,
+                Pose3DReconstruction.side_image_key == safe_key,
+                Pose3DReconstruction.top_image_key == safe_key,
+            ),
+            Project.owner_id == owner_id,
+        )
+    )
+    if (
+        not owns_original
+        and not owns_revision
+        and not owns_pose_reference
+        and not owns_pose3d_view
+    ):
         raise HTTPException(404, "Image not found.")
     blobs = _storage()
     try:
@@ -1163,6 +1299,119 @@ def check_pose_inspection(
     db.commit()
     db.refresh(inspection)
     return _pose_inspection_response(inspection, project)
+
+
+# ------------------------- 受控单图 3D 研究预览 -------------------------
+
+@app.get(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose3d/latest",
+    response_model=Pose3DReconstructionResponse | None,
+)
+def latest_pose3d_reconstruction(
+    project_id: str,
+    request: Request,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> Pose3DReconstructionResponse | None:
+    """Return the latest owner-only 3D hypothesis without triggering the GPU."""
+    _pose3d_client(request)
+    project = _owned_project(db, project_id, owner_id)
+    reconstruction = db.scalar(
+        select(Pose3DReconstruction)
+        .where(Pose3DReconstruction.project_id == project.id)
+        .order_by(Pose3DReconstruction.created_at.desc())
+        .limit(1)
+    )
+    if reconstruction is None:
+        return None
+    inspection = db.scalar(
+        select(PoseInspection)
+        .where(PoseInspection.project_id == project.id)
+        .order_by(PoseInspection.created_at.desc())
+        .limit(1)
+    )
+    current = (
+        PoseSkeleton.model_validate_json(inspection.skeleton_json)
+        if inspection is not None
+        else None
+    )
+    return _pose3d_response(reconstruction, current)
+
+
+@app.post(
+    f"{settings.api_prefix}/projects/{{project_id}}/pose3d/reconstruct",
+    response_model=Pose3DReconstructionResponse,
+)
+def reconstruct_pose3d(
+    project_id: str,
+    request: Request,
+    owner_id: str = Depends(request_owner),
+    db: Session = Depends(get_db),
+) -> Pose3DReconstructionResponse:
+    """Generate views from one confirmed 2D skeleton; never return anatomy verdicts."""
+    client = _pose3d_client(request)
+    project = _owned_project(db, project_id, owner_id)
+    inspection = db.scalar(
+        select(PoseInspection)
+        .where(PoseInspection.project_id == project.id)
+        .order_by(PoseInspection.created_at.desc())
+        .limit(1)
+    )
+    if inspection is None:
+        raise HTTPException(409, "Estimate and confirm the 2D skeleton first.")
+    skeleton = PoseSkeleton.model_validate_json(inspection.skeleton_json)
+    if not skeleton.confirmed:
+        raise HTTPException(409, "Confirm the 2D skeleton before generating a 3D preview.")
+    skeleton_hash = _skeleton_sha256(skeleton)
+    existing = db.scalar(
+        select(Pose3DReconstruction)
+        .where(
+            Pose3DReconstruction.project_id == project.id,
+            Pose3DReconstruction.skeleton_sha256 == skeleton_hash,
+        )
+        .order_by(Pose3DReconstruction.created_at.desc())
+        .limit(1)
+    )
+    if existing is not None:
+        return _pose3d_response(existing, skeleton)
+    try:
+        output = client.reconstruct(_storage().read(project.image_key), skeleton)
+    except Pose3DClientError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+    blobs = _storage()
+    saved_keys: list[str] = []
+    try:
+        for image in (
+            output.overlay_png,
+            output.camera_png,
+            output.side_png,
+            output.top_png,
+        ):
+            saved_keys.append(blobs.save(image, ".png"))
+        reconstruction = Pose3DReconstruction(
+            project_id=project.id,
+            pose_inspection_id=inspection.id,
+            skeleton_sha256=skeleton_hash,
+            model=output.model,
+            result_json=output.result.model_dump_json(),
+            overlay_image_key=saved_keys[0],
+            camera_image_key=saved_keys[1],
+            side_image_key=saved_keys[2],
+            top_image_key=saved_keys[3],
+        )
+        db.add(reconstruction)
+        db.commit()
+        db.refresh(reconstruction)
+    except Exception as exc:
+        db.rollback()
+        for key in saved_keys:
+            try:
+                blobs.delete(key)
+            except Exception:
+                pass
+        raise HTTPException(502, "Could not save the 3D research preview.") from exc
+    return _pose3d_response(reconstruction, skeleton)
 
 
 # ------------------------- 参考图人体结构检查 -------------------------

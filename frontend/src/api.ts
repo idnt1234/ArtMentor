@@ -8,6 +8,7 @@ import type {
   Analysis,
   IntentRestatement,
   PoseComparison,
+  Pose3DReconstruction,
   PoseInspection,
   PoseSkeleton,
   PoseStyleMode,
@@ -71,6 +72,7 @@ export interface SessionStatus {
   access_required: boolean;
   access_granted: boolean;
   pose_enabled: boolean;
+  pose3d_enabled: boolean;
   auth_enabled: boolean;
   account_required: boolean;
   account_deletion_enabled: boolean;
@@ -182,6 +184,12 @@ export const api = {
     }),
   checkPoseInspection: (projectId: string) =>
     request<PoseInspection>(`/projects/${projectId}/pose-inspection/check`, {
+      method: "POST",
+    }),
+  latestPose3D: (projectId: string) =>
+    request<Pose3DReconstruction | null>(`/projects/${projectId}/pose3d/latest`),
+  reconstructPose3D: (projectId: string) =>
+    request<Pose3DReconstruction>(`/projects/${projectId}/pose3d/reconstruct`, {
       method: "POST",
     }),
   // 参考人体检查：参考图入库 → 双侧骨架估计 → 用户修正确认 → 确定性比较。

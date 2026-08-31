@@ -52,6 +52,9 @@ class Project(Base):
     pose_inspections: Mapped[list["PoseInspection"]] = relationship(
         back_populates="project", cascade="all, delete-orphan"
     )
+    pose3d_reconstructions: Mapped[list["Pose3DReconstruction"]] = relationship(
+        back_populates="project", cascade="all, delete-orphan"
+    )
     # 删除 Project 时一并删除其点评和修改版，避免留下失去归属的记录。
 
 
@@ -135,6 +138,27 @@ class PoseInspection(Base):
     )
 
     project: Mapped[Project] = relationship(back_populates="pose_inspections")
+
+
+class Pose3DReconstruction(Base):
+    """受控 3D 研究预览；视图与生成它们的已确认 2D 骨架绑定。"""
+
+    __tablename__ = "pose3d_reconstructions"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id"), index=True)
+    pose_inspection_id: Mapped[str] = mapped_column(String(36), index=True)
+    skeleton_sha256: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="completed")
+    model: Mapped[str] = mapped_column(String(120))
+    result_json: Mapped[str] = mapped_column(Text)
+    overlay_image_key: Mapped[str] = mapped_column(String(255))
+    camera_image_key: Mapped[str] = mapped_column(String(255))
+    side_image_key: Mapped[str] = mapped_column(String(255))
+    top_image_key: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    project: Mapped[Project] = relationship(back_populates="pose3d_reconstructions")
 
 
 class AccountDailyUsage(Base):

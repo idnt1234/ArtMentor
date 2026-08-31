@@ -236,6 +236,42 @@ class PoseInspectionResponse(BaseModel):
     updated_at: datetime
 
 
+class Pose3DMetrics(BaseModel):
+    """2D evidence agreement for one single-image 3D hypothesis."""
+
+    bbox_diagonal_px: float = Field(gt=0)
+    reviewed_keypoint_count: int = Field(ge=0, le=17)
+    mean_projection_error_px: float | None = Field(default=None, ge=0)
+    mean_projection_error_normalized: float | None = Field(default=None, ge=0)
+
+
+class Pose3DResult(BaseModel):
+    """Persisted non-diagnostic metadata returned by the 3D worker."""
+
+    metrics: Pose3DMetrics
+    prompted_joints: list[str] = Field(default_factory=list, max_length=2)
+    inference_seconds: float = Field(ge=0)
+    limitations: list[str] = Field(min_length=1, max_length=8)
+
+
+class Pose3DReconstructionResponse(BaseModel):
+    """Owner-only research preview tied to a confirmed 2D skeleton snapshot."""
+
+    id: str
+    project_id: str
+    pose_inspection_id: str
+    status: Literal["completed"]
+    model: str
+    skeleton_sha256: str
+    stale: bool
+    overlay_image_url: str
+    camera_image_url: str
+    side_image_url: str
+    top_image_url: str
+    result: Pose3DResult
+    created_at: datetime
+
+
 # ------------------------- AI 点评核心结构 -------------------------
 
 class DimensionAnalysis(BaseModel):
