@@ -16,11 +16,28 @@ if ! command -v conda >/dev/null 2>&1; then
 fi
 
 mkdir -p "$POSE_HOME/src" "$POSE_HOME/models" "$POSE_HOME/runs"
-if [[ ! -d "$SAM_REPO/.git" ]]; then
-  git clone https://github.com/facebookresearch/sam-3d-body.git "$SAM_REPO"
+SOURCE_MARKER="$SAM_REPO/.artmentor-source-commit"
+if [[ -f "$SOURCE_MARKER" ]] && [[ "$(cat "$SOURCE_MARKER")" == "$SAM_COMMIT" ]]; then
+  echo "SAM 3D Body source is already pinned at $SAM_COMMIT."
+elif [[ -d "$SAM_REPO/.git" ]]; then
+  git -C "$SAM_REPO" fetch --depth 1 origin "$SAM_COMMIT"
+  git -C "$SAM_REPO" checkout --detach FETCH_HEAD
+  printf '%s\n' "$SAM_COMMIT" > "$SOURCE_MARKER"
+else
+  # AutoDL's route to GitHub occasionally drops git's HTTP stream. The
+  # immutable codeload archive is the same source and is much more reliable.
+  SOURCE_ARCHIVE="$POSE_HOME/src/sam-3d-body-$SAM_COMMIT.tar.gz"
+  if [[ -e "$SAM_REPO" ]]; then
+    mv "$SAM_REPO" "$SAM_REPO.incomplete.$(date +%s)"
+  fi
+  curl --fail --location --retry 5 --retry-delay 3 \
+    "https://codeload.github.com/facebookresearch/sam-3d-body/tar.gz/$SAM_COMMIT" \
+    --output "$SOURCE_ARCHIVE"
+  mkdir -p "$SAM_REPO"
+  tar -xzf "$SOURCE_ARCHIVE" --strip-components=1 -C "$SAM_REPO"
+  rm -f "$SOURCE_ARCHIVE"
+  printf '%s\n' "$SAM_COMMIT" > "$SOURCE_MARKER"
 fi
-git -C "$SAM_REPO" fetch --all --tags
-git -C "$SAM_REPO" checkout --detach "$SAM_COMMIT"
 
 if ! conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
   conda create -n "$ENV_NAME" python=3.11 -y
