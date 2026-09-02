@@ -52,9 +52,13 @@ PYTHON="$(conda run -n "$ENV_NAME" which python)"
   webdataset chump networkx==3.2.1 roma joblib seaborn wandb appdirs ffmpeg \
   cython jsonlines xtcocotools loguru optree fvcore pycocotools tensorboard \
   huggingface_hub
-"$PYTHON" -m pip install \
-  'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' \
-  --no-build-isolation --no-deps
+if "$PYTHON" -c 'import detectron2' >/dev/null 2>&1; then
+  echo "Detectron2 is already installed; skipping the GitHub rebuild."
+else
+  "$PYTHON" -m pip install \
+    'git+https://github.com/facebookresearch/detectron2.git@a1ce2f9' \
+    --no-build-isolation --no-deps
+fi
 "$PYTHON" -m pip install -r "$ARTMENTOR_REPO/pose3d_worker/requirements-service.txt"
 
 if [[ ! -f "$CHECKPOINT_DIR/model.ckpt" || ! -f "$CHECKPOINT_DIR/assets/mhr_model.pt" ]]; then
