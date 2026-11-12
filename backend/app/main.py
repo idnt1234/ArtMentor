@@ -71,7 +71,7 @@ from .schemas import (
     SampleArtwork,
     Suggestion,
 )
-from .services.ai import ArtMentorAI
+from .services.ai import ArtMentorAI, FeedbackLocale
 from .services.image_metrics import (
     compute_visual_metrics,
     prepare_analysis_image,
@@ -295,6 +295,16 @@ def _ai() -> ArtMentorAI:
     if ai is None:
         raise HTTPException(503, "AI service is still starting.")
     return ai
+
+
+def _feedback_locale(request: Request) -> FeedbackLocale | None:
+    # 仅识别前端显式选择的单一值，保留旧浏览器语言列表的行为。
+    language = request.headers.get("accept-language", "").strip().lower()
+    if language == "en":
+        return "en"
+    if language == "zh-cn":
+        return "zh-CN"
+    return None
 
 
 def _pose_client() -> PoseClient:
@@ -1055,6 +1065,7 @@ def restate_intent(
             project.stage,
             image=analysis_image,
             mime=analysis_mime,
+            locale=_feedback_locale(request),
         )
     core = generated.value
     return IntentRestatement(
@@ -1099,6 +1110,7 @@ def analyze_project(
             stage=confirmed_stage,
             metrics=metrics,
             action_context=confirmed_action,
+            locale=_feedback_locale(http_request),
         )
     core = generated.value
     # AI 只生成 ReferenceGoal，真正展示的作品从合法的公共领域目录中匹配。
@@ -1642,6 +1654,7 @@ async def create_revision(
             intent=project.intent_confirmed or project.intent_original,
             before_metrics=before_metrics,
             after_metrics=after_metrics,
+            locale=_feedback_locale(request),
         )
     comparison = ComparisonResult(
         **generated.value.model_dump(),
@@ -1727,5 +1740,7 @@ def frontend_spa(full_path: str):
         raise HTTPException(404, "Frontend build not found.")
     candidate = (frontend_dist / full_path).resolve()
     if candidate.is_file() and frontend_dist.resolve() in candidate.parents:
-        return FileResponse(candidate)
+        # WebP is not registered by default on every host.
+        media_type = "image/webp" if candidate.suffix.lower() == ".webp" else None
+        return FileResponse(candidate, media_type=media_type)
     return FileResponse(frontend_dist / "index.html")

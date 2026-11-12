@@ -1,3 +1,4 @@
+import { useLocale } from "../i18n";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type Konva from "konva";
 import {
@@ -46,6 +47,7 @@ export default function PoseCanvas({
   highlighted,
   fitToImage = false,
 }: Props) {
+  const { t } = useLocale();
   const containerRef = useRef<HTMLDivElement>(null);
   const bboxRef = useRef<Konva.Rect>(null);
   const transformerRef = useRef<Konva.Transformer>(null);
@@ -224,7 +226,7 @@ export default function PoseCanvas({
         </Layer>
       </Stage>
       <span className="pose-canvas-hint">
-        {skeleton ? "Drag joints to correct the skeleton" : "Frame one person, then estimate"}
+        {skeleton ? t("Drag joints to correct the skeleton") : t("Frame one person, then estimate")}
       </span>
     </div>
   );

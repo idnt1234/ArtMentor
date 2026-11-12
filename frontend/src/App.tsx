@@ -42,8 +42,12 @@ import {
   signOutAccount,
 } from "./auth";
 import AuthDialog, { type AuthMode } from "./components/AuthDialog";
+import Landing from "./components/Landing";
 import ReferenceGrid from "./components/ReferenceGrid";
 import RevisionCompare from "./components/RevisionCompare";
+import { useLocale } from "./i18n";
+import { LanguageSwitch } from "./LocaleProvider";
+import type { Locale, MessageValues } from "./locale";
 import type {
   Analysis,
   IntentRestatement,
@@ -90,12 +94,19 @@ function defaultResultTab(stage: string, poseEnabled: boolean): Tab {
   return poseEnabled && BODY_CHECK_STAGES.has(stage) ? "pose" : "critique";
 }
 
-function formatDate(value: string) {
+function formatDate(value: string, locale: Locale) {
   // 历史列表只显示便于扫读的月/日，完整时间仍由后端保存。
-  return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(new Date(value));
+  return new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(new Date(value));
+}
+
+function claimedNotice(count: number) {
+  return count === 1
+    ? { text: "One project from this browser is now saved to your account." }
+    : { text: "{count} projects from this browser are now saved to your account.", values: { count } };
 }
 
 function App() {
+  const { locale, t, errorText } = useLocale();
   // 顶层组件相当于轻量状态机：哪些对象存在，决定用户当前看到哪个业务阶段。
   // 这组状态描述完整业务阶段：作品 → 意图确认 → 点评 → 修改版对比。
   const [samples, setSamples] = useState<SampleArtwork[]>([]);
@@ -110,6 +121,7 @@ function App() {
   const [activeSuggestion, setActiveSuggestion] = useState<string | null>(null);
   const [tab, setTab] = useState<Tab>("critique");
   const [busy, setBusy] = useState<Busy>(null);
+  const [studyLoading, setStudyLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [feedback, setFeedback] = useState<Record<string, string>>({});
@@ -124,28 +136,33 @@ function App() {
   const [pose3dEnabled, setPose3dEnabled] = useState(false);
   // Supabase 负责可恢复账户；公开主页可匿名浏览，创作工作区需要登录。
   const [authEnabled, setAuthEnabled] = useState(false);
+  const [accountRequired, setAccountRequired] = useState(true);
   const [accountEmail, setAccountEmail] = useState<string | null>(null);
   const [accountDeletionEnabled, setAccountDeletionEnabled] = useState(false);
   const [dailyAiLimit, setDailyAiLimit] = useState<number | null>(null);
   const [dailyAiRemaining, setDailyAiRemaining] = useState<number | null>(null);
   const [authOpen, setAuthOpen] = useState(false);
   const [authMode, setAuthMode] = useState<AuthMode>("signin");
-  const [authNotice, setAuthNotice] = useState<string | null>(null);
+  const [authNotice, setAuthNotice] = useState<{ text: string; values?: MessageValues } | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const historyTriggerRef = useRef<HTMLElement | null>(null);
+  const closeHistoryRef = useRef<HTMLButtonElement>(null);
 
   const [form, setForm] = useState({
     title: "",
     stage: "Character design sketch",
-    style: "Digital illustration",
+    style: "",
     intent: "",
   });
   const [uploadFile, setUploadFile] = useState<File | null>(null);
   const previewUrl = useMemo(() => (uploadFile ? URL.createObjectURL(uploadFile) : null), [uploadFile]);
+  const canWork = Boolean(accountEmail) || !accountRequired;
 
   const applySessionStatus = useCallback((session: Awaited<ReturnType<typeof api.session>>) => {
     setPoseEnabled(session.pose_enabled);
     setPose3dEnabled(session.pose3d_enabled);
     setAuthEnabled(session.auth_enabled);
+    setAccountRequired(session.account_required);
     setAccountDeletionEnabled(session.account_deletion_enabled);
     setDailyAiLimit(session.daily_ai_limit);
     setDailyAiRemaining(session.daily_ai_remaining);
@@ -161,9 +178,9 @@ function App() {
       ?? (session.auth_user_id ? "ArtMentor account" : null),
     );
     if (session.claimed_projects > 0) {
-      setAuthNotice(`${session.claimed_projects} browser ${session.claimed_projects === 1 ? "project is" : "projects are"} now saved to your account.`);
+      setAuthNotice(claimedNotice(session.claimed_projects));
     }
-    if (session.auth_user_id && (!session.access_required || session.access_granted)) {
+    if ((!session.account_required || session.auth_user_id) && (!session.access_required || session.access_granted)) {
       setHistory(await api.projects());
     } else {
       setHistory([]);
@@ -198,7 +215,7 @@ function App() {
           setAuthOpen(true);
         }
         if (session.claimed_projects > 0) {
-          setAuthNotice(`${session.claimed_projects} browser ${session.claimed_projects === 1 ? "project is" : "projects are"} now saved to your account.`);
+          setAuthNotice(claimedNotice(session.claimed_projects));
         }
         stopListening = listenForAuthChanges((event) => {
           if (event === "PASSWORD_RECOVERY") {
@@ -219,7 +236,7 @@ function App() {
         return;
       }
       setSamples(await api.samples());
-      setHistory(session.auth_user_id ? await api.projects() : []);
+      setHistory(!session.account_required || session.auth_user_id ? await api.projects() : []);
     };
     bootstrap().catch((cause: Error) => setError(cause.message));
     return () => {
@@ -233,8 +250,24 @@ function App() {
     if (previewUrl) URL.revokeObjectURL(previewUrl);
   }, [previewUrl]);
 
-  // 每次产生新项目或新点评后重新读取历史，确保侧栏与数据库一致。
-  const refreshHistory = async () => setHistory(await api.projects());
+  useEffect(() => {
+    if (!menuOpen) return;
+    const trigger = historyTriggerRef.current;
+    closeHistoryRef.current?.focus();
+    const dismiss = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setMenuOpen(false);
+    };
+    window.addEventListener("keydown", dismiss);
+    return () => {
+      window.removeEventListener("keydown", dismiss);
+      if (trigger?.isConnected && trigger.getClientRects().length) trigger.focus();
+    };
+  }, [menuOpen]);
+
+  const openHistory = (trigger: HTMLElement) => {
+    historyTriggerRef.current = trigger;
+    setMenuOpen(true);
+  };
 
   const unlockDemo = async () => {
     // 访问码验证成功后，后端还会写入 HttpOnly Cookie，供后续图片请求使用。
@@ -247,7 +280,7 @@ function App() {
       applySessionStatus(session);
       if (!session.access_granted) throw new Error("That access code is not correct.");
       setSamples(await api.samples());
-      setHistory(session.auth_user_id ? await api.projects() : []);
+      setHistory(!session.account_required || session.auth_user_id ? await api.projects() : []);
       setAccessRequired(false);
     } catch (cause) {
       setDemoAccessCode("");
@@ -267,9 +300,21 @@ function App() {
     setAnalysis(null);
     setRevision(null);
     setUploadFile(null);
+    setForm({ title: "", stage: "Character design sketch", style: "", intent: "" });
     setActiveSuggestion(null);
     setTab("critique");
     setError(null);
+    setMenuOpen(false);
+  };
+
+  const goHome = () => {
+    resetWorkspace();
+    window.scrollTo({ top: 0 });
+  };
+
+  const openUpload = () => {
+    resetWorkspace();
+    requestAnimationFrame(() => document.getElementById("upload")?.scrollIntoView({ block: "start" }));
   };
 
   const openAccount = () => {
@@ -290,7 +335,7 @@ function App() {
     setDailyAiRemaining(null);
     resetWorkspace();
     setHistory([]);
-    setAuthNotice("Signed out. Sign in again whenever you want to create or open work.");
+    setAuthNotice({ text: "Signed out. Sign in again whenever you want to create or open work." });
   };
 
   const deleteCurrentAccount = async () => {
@@ -300,7 +345,7 @@ function App() {
     setDailyAiRemaining(null);
     setHistory([]);
     resetWorkspace();
-    setAuthNotice("Your account and ArtMentor data were permanently deleted.");
+    setAuthNotice({ text: "Your account and ArtMentor data were permanently deleted." });
   };
 
   const applyContextDraft = (draft: IntentRestatement, declaredStage: string) => {
@@ -312,10 +357,13 @@ function App() {
   };
 
   const loadProject = async (item: Project) => {
-    setBusy("analysis");
+    if (busy) return;
+    setBusy(item.latest_analysis_id ? "analysis" : "intent");
     setError(null);
     try {
       setProject(item);
+      setAnalysis(null);
+      setActiveSuggestion(null);
       setConfirmedIntent(item.intent_confirmed || item.intent_original);
       setConfirmedStage(item.stage);
       setConfirmedAction("");
@@ -332,7 +380,6 @@ function App() {
         setActiveSuggestion(loaded.result.suggestions[0]?.id ?? null);
         setTab(defaultResultTab(restoredStage, poseEnabled));
       } else {
-        setAnalysis(null);
         const restated = await api.restateIntent(item.id);
         applyContextDraft(restated, item.stage);
       }
@@ -344,8 +391,28 @@ function App() {
     }
   };
 
+  const loadStudy = async (url: string, title: string, style: string, intent: string) => {
+    if (busy || studyLoading) return;
+    setStudyLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(url);
+      if (!response.ok) throw new Error();
+      const blob = await response.blob();
+      if (blob.type !== "image/webp") throw new Error();
+      setUploadFile(new File([blob], `${title}.webp`, { type: blob.type }));
+      setForm({ title, stage: "Rendering", style, intent });
+      document.getElementById("upload")?.scrollIntoView({ block: "start" });
+    } catch {
+      setError("Could not load this study. Please try again.");
+      document.getElementById("upload")?.scrollIntoView({ block: "start" });
+    } finally {
+      setStudyLoading(false);
+    }
+  };
+
   const uploadArtwork = async () => {
-    if (!accountEmail) {
+    if (!canWork) {
       requireSignIn();
       return;
     }
@@ -361,14 +428,15 @@ function App() {
       payload.append("image", uploadFile);
       payload.append("title", form.title || uploadFile.name.replace(/\.[^.]+$/, ""));
       payload.append("stage", form.stage);
-      payload.append("style", form.style);
+      payload.append("style", form.style.trim() || "Digital illustration");
       payload.append("intent", form.intent);
       const created = await api.createProject(payload);
       setProject(created);
+      window.scrollTo({ top: 0 });
       const restated = await api.restateIntent(created.id);
       applyContextDraft(restated, created.stage);
-      await refreshHistory();
       await synchronizeAccount();
+      window.scrollTo({ top: 0 });
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -377,7 +445,7 @@ function App() {
   };
 
   const importSample = async (sampleId: string) => {
-    if (!accountEmail) {
+    if (!canWork) {
       requireSignIn();
       return;
     }
@@ -387,10 +455,11 @@ function App() {
     try {
       const created = await api.importSample(sampleId);
       setProject(created);
+      window.scrollTo({ top: 0 });
       const restated = await api.restateIntent(created.id);
       applyContextDraft(restated, created.stage);
-      await refreshHistory();
       await synchronizeAccount();
+      window.scrollTo({ top: 0 });
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -409,8 +478,8 @@ function App() {
       setIntentDraft(null);
       setActiveSuggestion(result.result.suggestions[0]?.id ?? null);
       setTab(defaultResultTab(confirmedStage, poseEnabled));
-      await refreshHistory();
       await synchronizeAccount();
+      window.scrollTo({ top: 0 });
     } catch (cause) {
       setError((cause as Error).message);
     } finally {
@@ -475,79 +544,109 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className={`sidebar ${menuOpen ? "open" : ""}`}>
+    <div className={`app-shell${project ? "" : " is-landing"}`}>
+      {menuOpen && <button type="button" tabIndex={-1} className="history-scrim" aria-label={t("Close recent work")} onClick={() => setMenuOpen(false)} />}
+      <aside id="recent-work" className={`sidebar ${menuOpen ? "open" : ""}`} role={menuOpen ? "dialog" : undefined} aria-modal={menuOpen || undefined} aria-label={t("Recent work")} inert={authOpen}>
         <div className="brand-row">
-          <button className="brand" onClick={resetWorkspace} aria-label="ArtMentor home">
+          <button className="brand" disabled={busy !== null} onClick={goHome} aria-label={t("ArtMentor home")}>
             <span className="brand-mark"><PenLine size={17} /></span>
             <span>ArtMentor</span>
           </button>
-          <button className="mobile-close" onClick={() => setMenuOpen(false)}><X size={20} /></button>
+          <button ref={closeHistoryRef} className="mobile-close" onClick={() => setMenuOpen(false)} aria-label={t("Close recent work")}><X size={20} /></button>
         </div>
-        <button className="new-critique" onClick={resetWorkspace}>
-          <ImagePlus size={17} /> New critique
+        <button className="new-critique" disabled={busy !== null} onClick={openUpload}>
+          <ImagePlus size={17} /> {" "}{t("New critique")}
         </button>
-        <div className="history-heading"><span>Recent work</span><Clock3 size={14} /></div>
+        <div className="history-heading"><span>{t("Recent work")}</span><Clock3 size={14} /></div>
         <nav className="history-list">
           {history.map((item) => (
             <button
               key={item.id}
+              disabled={busy !== null}
               onClick={() => loadProject(item)}
               className={project?.id === item.id ? "active" : ""}
             >
               <img src={assetUrl(item.image_url)} alt="" />
-              <span><strong>{item.title}</strong><small>{item.stage} · {formatDate(item.created_at)}</small></span>
+              <span><strong>{item.title}</strong><small>{t(item.stage)} · {formatDate(item.created_at, locale)}</small></span>
             </button>
           ))}
-          {history.length === 0 && <p className="empty-history">Your critique history will appear here.</p>}
+          {history.length === 0 && <p className="empty-history">{t("Your critique history will appear here.")}</p>}
         </nav>
         <div className="sidebar-footer">
-          <span><Cloud size={15} /> {accountEmail ? "Account sync on" : "AI vision"}</span>
-          <small>{accountEmail ? accountEmail : "Sign in to create critiques"}</small>
+          <span><Cloud size={15} /> {accountEmail ? t("Account sync on") : t("AI vision")}</span>
+          <small>{accountEmail ?? t(accountRequired ? "Sign in to create critiques" : "Local workspace")}</small>
         </div>
       </aside>
 
-      <main className="workspace">
-        <header className="topbar">
-          <button className="mobile-menu" onClick={() => setMenuOpen(true)}><Menu size={20} /></button>
-          <div>
-            <p className="eyebrow">Intent-aware illustration critique</p>
-            <h1>{project?.title || "New critique"}</h1>
-          </div>
+      <main className="workspace" inert={menuOpen || authOpen}>
+        <header className={`topbar${project ? "" : " landing-topbar"}`}>
+          {project ? (
+            <>
+              <button className="mobile-menu" aria-label={t("Open recent work")} aria-expanded={menuOpen} aria-controls="recent-work" onClick={(event) => openHistory(event.currentTarget)}><Menu size={20} /></button>
+              <div className="workspace-title">
+                <p className="eyebrow">{t("Intent-aware illustration critique")}</p>
+                <h1>{project.title}</h1>
+              </div>
+            </>
+          ) : (
+            <>
+              <a href="#top" className="brand landing-brand" aria-label={t("ArtMentor home")}>
+                <span className="brand-mark"><PenLine size={17} /></span>
+                <span>ArtMentor</span>
+              </a>
+              <nav className="landing-nav" aria-label={t("Main navigation")}>
+                <a href="#how-it-works">{t("How it works")}</a>
+                <a href="#gallery">{t("Examples")}</a>
+              </nav>
+            </>
+          )}
           <div className="topbar-actions">
-            {authEnabled && (
-              <button className={`account-trigger ${accountEmail ? "signed-in" : ""}`} onClick={openAccount} title={accountEmail ?? "Sign in to sync your work"}>
-                {accountEmail ? <UserRound size={16} /> : <LogIn size={16} />}
-                <span>{accountEmail ? accountEmail.split("@")[0] : "Sign in"}</span>
+            {!project && canWork && (
+              <button className="account-trigger history-trigger" aria-label={t("Open recent work")} aria-expanded={menuOpen} aria-controls="recent-work" onClick={(event) => openHistory(event.currentTarget)}>
+                <Clock3 size={16} /> <span>{t("My work")}</span>
               </button>
             )}
-            <div className="status-pill"><span /> {busy ? "Working" : analysis ? "Analysis ready" : "Ready"}</div>
+            <LanguageSwitch />
+            {authEnabled && (
+              <button className={`account-trigger ${accountEmail ? "signed-in" : ""}`} disabled={busy !== null} onClick={openAccount} title={accountEmail ?? t("Sign in to sync your work")}>
+                {accountEmail ? <UserRound size={16} /> : <LogIn size={16} />}
+                <span>{accountEmail ? accountEmail.split("@")[0] : t("Sign in")}</span>
+              </button>
+            )}
+            {project && <div className="status-pill" role="status"><span /> {busy ? t("Working") : analysis ? t("Analysis ready") : t("Ready")}</div>}
           </div>
         </header>
 
         {authNotice && (
-          <div className="success-banner"><UserRound size={17} /><span>{authNotice}</span><button onClick={() => setAuthNotice(null)}><X size={16} /></button></div>
+          <div className="success-banner" role="status"><UserRound size={17} /><span>{t(authNotice.text, authNotice.values)}</span><button aria-label={t("Dismiss message")} onClick={() => setAuthNotice(null)}><X size={16} /></button></div>
         )}
 
-        {error && (
-          <div className="error-banner"><CircleHelp size={17} /><span>{error}</span><button onClick={() => setError(null)}><X size={16} /></button></div>
+        {error && project && (
+          <div className="error-banner" role="alert"><CircleHelp size={17} /><span>{errorText(error)}</span><button aria-label={t("Dismiss message")} onClick={() => setError(null)}><X size={16} /></button></div>
         )}
 
         {!project && (
-          <UploadWorkspace
-            form={form}
-            setForm={setForm}
-            uploadFile={uploadFile}
-            setUploadFile={setUploadFile}
-            previewUrl={previewUrl}
-            fileRef={fileRef}
-            samples={samples}
-            busy={busy}
-            onSubmit={uploadArtwork}
-            onSample={importSample}
-            signedIn={Boolean(accountEmail)}
-            onRequireSignIn={requireSignIn}
-          />
+          <div id="top">
+            <Landing locale={locale} onTryStudy={loadStudy} busy={busy !== null || studyLoading}>
+              <UploadWorkspace
+                form={form}
+                setForm={setForm}
+                uploadFile={uploadFile}
+                setUploadFile={setUploadFile}
+                previewUrl={previewUrl}
+                fileRef={fileRef}
+                samples={samples}
+                busy={busy}
+                disabled={studyLoading}
+                error={error ? errorText(error) : null}
+                onDismissError={() => setError(null)}
+                canWork={canWork}
+                onSubmit={uploadArtwork}
+                onSample={importSample}
+                onRequireSignIn={requireSignIn}
+              />
+            </Landing>
+          </div>
         )}
 
         {project && intentDraft && (
@@ -565,12 +664,22 @@ function App() {
           />
         )}
 
-        {project && !intentDraft && busy === "analysis" && !analysis && <LoadingAnalysis />}
+        {project && !intentDraft && busy && !analysis && <LoadingAnalysis readingIntent={busy !== "analysis"} />}
+
+        {project && !intentDraft && !busy && !analysis && (
+          <section className="workspace-retry">
+            <h2>{t("Resume this project")}</h2>
+            <p>{t("Your artwork is saved. You can retry opening the next step.")}</p>
+            <button type="button" className="primary-action" onClick={() => void loadProject(project)}>
+              <RotateCcw size={16} /> {t("Retry")}
+            </button>
+          </section>
+        )}
 
         {project && analysis && (
           <div className={`analysis-layout ${tab === "pose" ? "pose-active" : ""}`}>
             {tab !== "pose" && <section className="artwork-column">
-              <Suspense fallback={<div className="canvas-loading"><LoaderCircle className="spin" size={25} /> Preparing canvas…</div>}>
+              <Suspense fallback={<div className="canvas-loading"><LoaderCircle className="spin" size={25} /> {" "}{t("Preparing canvas…")}</div>}>
                 <AnnotationCanvas
                   imageUrl={assetUrl(project.image_url)}
                   suggestions={analysis.result.suggestions}
@@ -580,7 +689,7 @@ function App() {
                 />
               </Suspense>
               <div className="palette-strip">
-                <span>Extracted palette</span>
+                <span>{t("Extracted palette")}</span>
                 <div>{analysis.result.visual_metrics.palette.map((color) => <i key={color} style={{ background: color }} title={color} />)}</div>
                 <small>{analysis.result.visual_metrics.width} × {analysis.result.visual_metrics.height}</small>
               </div>
@@ -588,15 +697,15 @@ function App() {
 
             <aside className="inspector">
               <div className="tabs">
-                <button className={tab === "critique" ? "active" : ""} onClick={() => setTab("critique")}>Critique</button>
-                <button className={tab === "references" ? "active" : ""} onClick={() => setTab("references")}>References</button>
+                <button className={tab === "critique" ? "active" : ""} onClick={() => setTab("critique")}>{t("Critique")}</button>
+                <button className={tab === "references" ? "active" : ""} onClick={() => setTab("references")}>{t("References")}</button>
                 {poseEnabled && (
-                  <button className={tab === "pose" ? "active" : ""} onClick={() => setTab("pose")}><ScanLine size={13} /> Body structure</button>
+                  <button className={tab === "pose" ? "active" : ""} onClick={() => setTab("pose")}><ScanLine size={13} /> {" "}{t("Body structure")}</button>
                 )}
-                <button className={tab === "revision" ? "active" : ""} onClick={() => setTab("revision")}>Revision</button>
+                <button className={tab === "revision" ? "active" : ""} onClick={() => setTab("revision")}>{t("Revision")}</button>
               </div>
 
-              {tab === "critique" && analysis.result.warning && <div className="demo-notice"><Sparkles size={15} />{analysis.result.warning}</div>}
+              {tab === "critique" && analysis.result.warning && <div className="demo-notice"><Sparkles size={15} />{errorText(analysis.result.warning)}</div>}
 
               {tab === "critique" && (
                 <CritiquePanel
@@ -613,13 +722,13 @@ function App() {
               )}
               {tab === "references" && (
                 <div className="panel-scroll">
-                  <div className="section-intro"><p className="eyebrow">Public-domain study set</p><h2>Look with a purpose.</h2><p>Each work is paired to a specific decision in your critique. Open the museum record for provenance.</p></div>
+                  <div className="section-intro"><p className="eyebrow">{t("Public-domain study set")}</p><h2>{t("Look with a purpose.")}</h2><p>{t("Each work is paired to a specific decision in your critique. Open the museum record for provenance.")}</p></div>
                   <ReferenceGrid references={analysis.result.references} />
                 </div>
               )}
               {poseEnabled && tab === "pose" && (
                 <div className="panel-scroll pose-scroll">
-                  <Suspense fallback={<div className="pose-loading"><LoaderCircle className="spin" size={22} /> Loading body-check workspace…</div>}>
+                  <Suspense fallback={<div className="pose-loading"><LoaderCircle className="spin" size={22} /> {" "}{t("Loading body-check workspace…")}</div>}>
                     <BodyCheckPanel
                       project={project}
                       pose3dEnabled={pose3dEnabled}
@@ -633,9 +742,9 @@ function App() {
                   {!revision ? (
                     <label className={`revision-drop ${busy === "revision" ? "disabled" : ""}`}>
                       {busy === "revision" ? <LoaderCircle className="spin" size={28} /> : <RotateCcw size={28} />}
-                      <h2>{busy === "revision" ? "Comparing versions…" : "Upload your revision"}</h2>
-                      <p>ArtMentor will compare the before and after across all four dimensions.</p>
-                      <span>Choose revised artwork</span>
+                      <h2>{busy === "revision" ? t("Comparing versions…") : t("Upload your revision")}</h2>
+                      <p>{t("ArtMentor will compare the before and after across all four dimensions.")}</p>
+                      <span>{t("Choose revised artwork")}</span>
                       <input type="file" accept="image/jpeg,image/png,image/webp" disabled={busy === "revision"} onChange={(event) => {
                         const file = event.target.files?.[0];
                         if (file) uploadRevision(file);
@@ -679,23 +788,25 @@ function AccessGate({ value, onChange, onSubmit, busy, error }: {
   busy: boolean;
   error: string | null;
 }) {
+  const { t, errorText } = useLocale();
   // 共享 Demo 的预算门禁；它不是用户账号系统，匿名数据隔离仍由后端负责。
   return (
     <main className="access-shell">
       <section className="access-card">
+        <LanguageSwitch />
         <span className="access-icon"><LockKeyhole size={22} /></span>
-        <p className="eyebrow">Private demo</p>
-        <h1>Welcome to ArtMentor.</h1>
-        <p>This preview uses a shared AI budget. Enter the access code provided by the creator to continue.</p>
+        <p className="eyebrow">{t("Private demo")}</p>
+        <h1>{t("Welcome to ArtMentor.")}</h1>
+        <p>{t("This preview uses a shared AI budget. Enter the access code provided by the creator to continue.")}</p>
         <form onSubmit={(event) => { event.preventDefault(); onSubmit(); }}>
-          <label><span>Demo access code</span><input type="password" autoFocus value={value} onChange={(event) => onChange(event.target.value)} autoComplete="off" /></label>
+          <label><span>{t("Demo access code")}</span><input type="password" autoFocus value={value} onChange={(event) => onChange(event.target.value)} autoComplete="off" /></label>
           <button className="primary-action" disabled={busy || !value.trim()} type="submit">
             {busy ? <LoaderCircle className="spin" size={18} /> : <ArrowRight size={18} />}
-            Enter ArtMentor
+            {t("Enter ArtMentor")}
           </button>
         </form>
-        {error && <p className="access-error">{error}</p>}
-        <small>Your code stays in this browser tab and is never included in the public source code.</small>
+        {error && <p className="access-error" role="alert">{errorText(error)}</p>}
+        <small>{t("Your code stays in this browser tab and is never included in the public source code.")}</small>
       </section>
     </main>
   );
@@ -712,64 +823,102 @@ interface UploadProps {
   busy: Busy;
   onSubmit: () => void;
   onSample: (id: string) => void;
-  signedIn: boolean;
+  canWork: boolean;
+  disabled: boolean;
+  error: string | null;
+  onDismissError: () => void;
   onRequireSignIn: () => void;
 }
 
-function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl, fileRef, samples, busy, onSubmit, onSample, signedIn, onRequireSignIn }: UploadProps) {
-  // 首屏收集模型理解作品所需的最小上下文，也提供无需上传的公共领域样例入口。
+function UploadWorkspace({ form, setForm, uploadFile, setUploadFile, previewUrl, fileRef, samples, busy, disabled, error, onDismissError, onSubmit, onSample, canWork, onRequireSignIn }: UploadProps) {
+  const { t } = useLocale();
+  const [dragging, setDragging] = useState(false);
+  const [fileError, setFileError] = useState<string | null>(null);
+  const waiting = disabled || busy !== null;
+  const invalidFile = Boolean(fileError && !uploadFile);
   const update = (key: keyof UploadProps["form"], value: string) => setForm((current) => ({ ...current, [key]: value }));
+  const selectFile = (file?: File) => {
+    if (!file) return;
+    const supported = file.type
+      ? /^image\/(jpeg|png|webp)$/.test(file.type)
+      : /\.(jpe?g|png|webp)$/i.test(file.name);
+    if (!supported || file.size > 10 * 1024 * 1024) {
+      setUploadFile(null);
+      setFileError("Choose a JPG, PNG or WebP file under 10 MB.");
+      return;
+    }
+    setFileError(null);
+    setUploadFile(file);
+  };
   return (
     <div className="onboarding">
-      <section className="onboarding-copy">
-        <p className="eyebrow">A second pair of eyes, built for illustrators</p>
-        <h2>Make the next revision<br />the one that matters.</h2>
-        <p>ArtMentor reads your intent first, then gives a focused critique across composition, value, color, and visual narrative.</p>
-        <div className="promise-row">
-          <span><Target size={16} /> Three priorities, maximum</span>
-          <span><PenLine size={16} /> Editable image annotations</span>
-          <span><RotateCcw size={16} /> Before-and-after report</span>
+      <form className="upload-card" onSubmit={(event) => {
+        event.preventDefault();
+        if (!waiting && !invalidFile) (canWork ? onSubmit : onRequireSignIn)();
+      }}>
+        <div className="upload-media">
+          <button
+            type="button"
+            className={`drop-zone ${previewUrl ? "has-image" : ""}${dragging ? " is-dragging" : ""}`}
+            disabled={waiting}
+            onClick={() => canWork ? fileRef.current?.click() : onRequireSignIn()}
+            onDragOver={(event) => { event.preventDefault(); if (!waiting) setDragging(true); }}
+            onDragLeave={() => setDragging(false)}
+            onDrop={(event) => {
+              event.preventDefault();
+              setDragging(false);
+              if (waiting) return;
+              if (!canWork) onRequireSignIn();
+              else selectFile(event.dataTransfer.files[0]);
+            }}
+          >
+            {previewUrl ? <img src={previewUrl} alt={t("Artwork preview")} /> : <><span className="upload-icon"><Upload size={22} /></span><strong>{t("Choose or drop your artwork")}</strong><small>{t("JPG, PNG or WebP · up to 10 MB")}</small></>}
+            {previewUrl && <span className="change-image">{t("Change artwork")}</span>}
+          </button>
+          <input ref={fileRef} hidden type="file" accept="image/jpeg,image/png,image/webp" disabled={!canWork || waiting} onChange={(event) => {
+            selectFile(event.target.files?.[0]);
+            event.target.value = "";
+          }} />
+          {fileError && invalidFile && <p className="upload-file-error" role="alert">{t(fileError)}</p>}
         </div>
-      </section>
-
-      <section className="upload-card">
-        <button className={`drop-zone ${previewUrl ? "has-image" : ""}`} onClick={() => signedIn ? fileRef.current?.click() : onRequireSignIn()}>
-          {previewUrl ? <img src={previewUrl} alt="Artwork preview" /> : <><span className="upload-icon"><Upload size={22} /></span><strong>Drop your artwork here</strong><small>JPG, PNG or WebP · up to 10 MB</small></>}
-          {previewUrl && <span className="change-image">Change artwork</span>}
-        </button>
-        <input ref={fileRef} hidden type="file" accept="image/jpeg,image/png,image/webp" disabled={!signedIn} onChange={(event) => setUploadFile(event.target.files?.[0] ?? null)} />
         <div className="form-grid">
-          <label className="full"><span>Project title <em>optional</em></span><input value={form.title} onChange={(e) => update("title", e.target.value)} placeholder={uploadFile?.name.replace(/\.[^.]+$/, "") || "Evening light study"} /></label>
-          <label><span>Stage</span><select value={form.stage} onChange={(e) => update("stage", e.target.value)}>{STAGES.map((stage) => <option key={stage}>{stage}</option>)}</select></label>
-          <label><span>Style</span><input value={form.style} onChange={(e) => update("style", e.target.value)} placeholder="Painterly fantasy" /></label>
-          <label className="full"><span>What are you trying to communicate?</span><textarea rows={4} value={form.intent} onChange={(e) => update("intent", e.target.value)} placeholder="I want the quiet figure to feel small against the city, but still hopeful…" /></label>
+          <label className="full"><span>{t("Project title")}{" "} <em>{t("optional")}</em></span><input value={form.title} onChange={(e) => update("title", e.target.value)} placeholder={uploadFile?.name.replace(/\.[^.]+$/, "") || t("Evening light study")} /></label>
+          <label><span>{t("Stage")}</span><select value={form.stage} onChange={(e) => update("stage", e.target.value)}>{STAGES.map((stage) => <option key={stage} value={stage}>{t(stage)}</option>)}</select></label>
+          <label><span>{t("Style")}</span><input value={form.style} onChange={(e) => update("style", e.target.value)} placeholder={t("Painterly fantasy")} /></label>
+          <label className="full"><span>{t("What are you trying to communicate?")}</span><textarea rows={4} value={form.intent} onChange={(e) => update("intent", e.target.value)} placeholder={t("I want the quiet figure to feel small against the city, but still hopeful…")} /></label>
+          {error && (
+            <div className="error-banner upload-error" role="alert">
+              <CircleHelp size={17} /><span>{error}</span>
+              <button type="button" aria-label={t("Dismiss message")} onClick={onDismissError}><X size={16} /></button>
+            </div>
+          )}
+          <button type="submit" className="primary-action" disabled={waiting || invalidFile}>
+            {waiting ? <LoaderCircle className="spin" size={18} /> : canWork ? <Sparkles size={18} /> : <LogIn size={18} />}
+            {t(canWork ? "Clarify my intent" : "Sign in to start")} <ArrowRight size={17} />
+          </button>
+          <p className="upload-privacy">{t("Your artwork is stored in your private account history and is sent to the configured AI provider only when you request a visual check, critique, or revision comparison.")}</p>
         </div>
-        <button className="primary-action" disabled={busy !== null} onClick={signedIn ? onSubmit : onRequireSignIn}>
-          {busy === "upload" ? <LoaderCircle className="spin" size={18} /> : signedIn ? <Sparkles size={18} /> : <LogIn size={18} />}
-          {signedIn ? "Clarify my intent" : "Sign in to start"} <ArrowRight size={17} />
-        </button>
-        <p className="upload-privacy">Your artwork is stored in your private account history and is sent to the configured AI provider only when you request a visual check, critique, or revision comparison.</p>
-      </section>
+      </form>
 
-      <section className="sample-section">
-        <div><p className="eyebrow">No artwork ready?</p><h3>Try a public-domain study.</h3></div>
+      {samples.length > 0 && <section className="sample-section">
+        <div><p className="eyebrow">{t("No artwork ready?")}</p><h3>{t("Try a public-domain study.")}</h3></div>
         <div className="sample-grid">
           {samples.map((sample) => (
-            <button key={sample.id} onClick={() => signedIn ? onSample(sample.id) : onRequireSignIn()} disabled={busy !== null}>
-              <img src={sample.image_url} alt={sample.title} />
+            <button key={sample.id} onClick={() => canWork ? onSample(sample.id) : onRequireSignIn()} disabled={waiting}>
+              <img src={assetUrl(sample.image_url)} alt="" loading="lazy" />
               <span><strong>{sample.title}</strong><small>{sample.artist} · {sample.license}</small></span>
               <ChevronRight size={17} />
             </button>
           ))}
         </div>
-      </section>
+      </section>}
 
       <section className="privacy-notice" aria-labelledby="privacy-title">
         <LockKeyhole size={20} />
         <div>
-          <p className="eyebrow">Privacy at a glance</p>
-          <h3 id="privacy-title">Your work stays attached to your account.</h3>
-          <p>ArtMentor stores your uploads, critique history, feedback, revision comparisons, and daily usage count. Your email and password authentication are handled by Supabase. Images and the intent you provide are sent to the configured AI provider only when you ask for an AI-powered action. You can download a ZIP of your data or permanently delete your account and stored work from the account menu.</p>
+          <p className="eyebrow">{t("Privacy at a glance")}</p>
+          <h3 id="privacy-title">{t("Your work stays attached to your account.")}</h3>
+          <p>{t("ArtMentor stores your uploads, critique history, feedback, revision comparisons, and daily usage count. Your email and password authentication are handled by Supabase. Images and the intent you provide are sent to the configured AI provider only when you ask for an AI-powered action. You can download a ZIP of your data or permanently delete your account and stored work from the account menu.")}</p>
         </div>
       </section>
     </div>
@@ -788,34 +937,35 @@ function IntentConfirmation({ project, draft, value, onChange, stage, onStageCha
   busy: Busy;
   onConfirm: () => void;
 }) {
+  const { t } = useLocale();
   // 把 AI 的意图复述做成可编辑门槛：用户确认后，这段文字才成为点评判断基准。
   return (
     <div className="intent-layout">
-      <div className="intent-art"><img src={assetUrl(project.image_url)} alt={project.title} /><div><span>{stage}</span><span>{project.style}</span></div></div>
+      <div className="intent-art"><img src={assetUrl(project.image_url)} alt={project.title} /><div><span>{t(stage)}</span><span>{t(project.style)}</span></div></div>
       <section className="intent-card">
-        <div className="step-label"><span>1</span> Confirm what ArtMentor should assume</div>
-        <p className="eyebrow">Before any critique</p>
-        <h2>Let’s make sure we are looking at the same picture.</h2>
-        <p className="intent-explainer">Confirm the stage, action, and intent first. Uncertain visual interpretations will not be treated as facts.</p>
+        <div className="step-label"><span>1</span> {" "}{t("Confirm what ArtMentor should assume")}</div>
+        <p className="eyebrow">{t("Before any critique")}</p>
+        <h2>{t("Let’s make sure we are looking at the same picture.")}</h2>
+        <p className="intent-explainer">{t("Confirm the stage, action, and intent first. Uncertain visual interpretations will not be treated as facts.")}</p>
 
         <div className="perception-audit">
           {draft.visual_observations.length > 0 && (
             <div className="audit-block">
-              <span className="audit-label">Visible facts</span>
+              <span className="audit-label">{t("Visible facts")}</span>
               {draft.visual_observations.map((observation) => <p key={observation}><Check size={14} />{observation}</p>)}
             </div>
           )}
 
           <label className="stage-confirmation">
-            <span className="audit-label">Critique stage</span>
+            <span className="audit-label">{t("Critique stage")}</span>
             <select value={stage} onChange={(event) => onStageChange(event.target.value)}>
-              {STAGES.map((item) => <option key={item}>{item}</option>)}
+              {STAGES.map((item) => <option key={item} value={item}>{t(item)}</option>)}
             </select>
-            <small className={`audit-status ${draft.stage_assessment}`}>{draft.stage_assessment}</small>
+            <small className={`audit-status ${draft.stage_assessment}`}>{t(draft.stage_assessment)}</small>
             {draft.stage_note && <p>{draft.stage_note}</p>}
             {draft.suggested_stage && draft.suggested_stage !== stage && STAGES.includes(draft.suggested_stage) && (
               <button className="stage-suggestion" onClick={() => onStageChange(draft.suggested_stage!)} type="button">
-                Use suggested stage: {draft.suggested_stage}
+                {t("Use suggested stage:")} {t(draft.suggested_stage)}
               </button>
             )}
           </label>
@@ -823,10 +973,10 @@ function IntentConfirmation({ project, draft, value, onChange, stage, onStageCha
           {draft.action_status !== "not_applicable" && (
             <div className="audit-block action-audit">
               <div className="audit-heading">
-                <span className="audit-label">Character action</span>
-                <small className={`audit-status ${draft.action_status}`}>{draft.action_status}</small>
+                <span className="audit-label">{t("Character action")}</span>
+                <small className={`audit-status ${draft.action_status}`}>{t(draft.action_status)}</small>
               </div>
-              <p className="action-question">{draft.action_question || "What should this action be read as?"}</p>
+              <p className="action-question">{draft.action_question || t("What should this action be read as?")}</p>
               {draft.action_hypotheses.length > 0 && (
                 <div className="action-options">
                   {draft.action_hypotheses.map((hypothesis) => (
@@ -841,11 +991,11 @@ function IntentConfirmation({ project, draft, value, onChange, stage, onStageCha
                     </button>
                   ))}
                   <button
-                    className={action === "The exact action is intentionally ambiguous." ? "selected" : ""}
-                    onClick={() => onActionChange("The exact action is intentionally ambiguous.")}
+                    className={action === "The exact action is intentionally ambiguous." || action === "这个动作有意保持模糊。" ? "selected" : ""}
+                    onClick={() => onActionChange(t("The exact action is intentionally ambiguous."))}
                     type="button"
                   >
-                    Keep it ambiguous
+                    {t("Keep it ambiguous")}
                   </button>
                 </div>
               )}
@@ -860,30 +1010,31 @@ function IntentConfirmation({ project, draft, value, onChange, stage, onStageCha
                 className="action-context-input"
                 value={action}
                 onChange={(event) => onActionChange(event.target.value)}
-                placeholder="Describe the action, or leave blank if it should stay unknown"
+                placeholder={t("Describe the action, or leave blank if it should stay unknown")}
               />
             </div>
           )}
         </div>
 
-        <label className="intent-editor"><span>ArtMentor’s reading of your intent</span><textarea value={value} onChange={(event) => onChange(event.target.value)} rows={6} /></label>
-        {draft.assumptions.length > 0 && <div className="assumptions"><span>Assumptions to verify</span>{draft.assumptions.map((item) => <p key={item}><Check size={14} />{item}</p>)}</div>}
+        <label className="intent-editor"><span>{t("ArtMentor’s reading of your intent")}</span><textarea value={value} onChange={(event) => onChange(event.target.value)} rows={6} /></label>
+        {draft.assumptions.length > 0 && <div className="assumptions"><span>{t("Assumptions to verify")}</span>{draft.assumptions.map((item) => <p key={item}><Check size={14} />{item}</p>)}</div>}
         <div className="confirmation-question"><Target size={18} /><p>{draft.confirmation_question}</p></div>
         <button className="primary-action" disabled={busy !== null} onClick={onConfirm}>
           {busy === "analysis" ? <LoaderCircle className="spin" size={18} /> : <Sparkles size={18} />}
-          Confirm and critique <ArrowRight size={17} />
+          {t("Confirm and critique")}{" "} <ArrowRight size={17} />
         </button>
         <small className="model-note">
-          Visual context checked by {draft.provider === "demo" ? "offline demo mode" : draft.provider === "gptsapi" ? `WildAI · ${draft.model}` : draft.model}
+          {t("Visual context checked by {model}", { model: draft.provider === "demo" ? t("offline demo mode") : draft.provider === "gptsapi" ? `WildAI · ${draft.model}` : draft.model })}
         </small>
       </section>
     </div>
   );
 }
 
-function LoadingAnalysis() {
+function LoadingAnalysis({ readingIntent }: { readingIntent: boolean }) {
+  const { t } = useLocale();
   // 视觉模型调用可能需要较长时间，用明确阶段文案代替空白页面。
-  return <div className="loading-analysis"><div className="orbit"><span /><span /><Sparkles size={28} /></div><p className="eyebrow">Reading the artwork</p><h2>Building a focused critique…</h2><p>Composition · Value · Color · Narrative</p></div>;
+  return <div className="loading-analysis" role="status"><div className="orbit"><span /><span /><Sparkles size={28} /></div><p className="eyebrow">{t("Reading the artwork")}</p><h2>{t(readingIntent ? "Checking visual context…" : "Building a focused critique…")}</h2><p>{t("Composition · Value · Color · Narrative")}</p></div>;
 }
 
 interface CritiquePanelProps {
@@ -899,13 +1050,14 @@ interface CritiquePanelProps {
 }
 
 function CritiquePanel(props: CritiquePanelProps) {
+  const { t } = useLocale();
   // 按“总评 → 四维概览 → 三条重点建议 → 针对性练习”展示结构化结果。
   // 每条建议内部固定为术语、白话、目标和步骤，避免模型输出变成难懂的长段落。
   const result = props.analysis.result;
   return (
     <div className="panel-scroll critique-panel">
       <section className="overall-card">
-        <p className="eyebrow">Overall read</p>
+        <p className="eyebrow">{t("Overall read")}</p>
         <h2>{result.overall_read}</h2>
         <div className="strengths">{result.strengths.map((item) => <span key={item}><Check size={14} />{item}</span>)}</div>
       </section>
@@ -913,32 +1065,32 @@ function CritiquePanel(props: CritiquePanelProps) {
       <section className="dimension-grid">
         {result.dimensions.map((dimension) => {
           const Icon = DIMENSION_ICONS[dimension.dimension];
-          return <article key={dimension.dimension}><div><Icon size={17} /><span>{dimension.dimension}</span><strong>{dimension.score}<small>/10</small></strong></div><h4>{dimension.headline}</h4></article>;
+          return <article key={dimension.dimension}><div><Icon size={17} /><span>{t(dimension.dimension)}</span><strong>{dimension.score}<small>/10</small></strong></div><h4>{dimension.headline}</h4></article>;
         })}
       </section>
 
       <section className="suggestions-section">
-        <div className="section-title"><div><p className="eyebrow">Highest-leverage moves</p><h3>{result.suggestions.length} priorities for the next pass</h3></div><span>Click to locate</span></div>
+        <div className="section-title"><div><p className="eyebrow">{t("Highest-leverage moves")}</p><h3>{t("{count} priorities for the next pass", { count: result.suggestions.length })}</h3></div><span>{t("Click to locate")}</span></div>
         {result.suggestions.map((suggestion, index) => (
           <article key={suggestion.id} className={`suggestion-card ${props.activeSuggestion === suggestion.id ? "active" : ""}`} onClick={() => props.setActiveSuggestion(suggestion.id)}>
             <div className="suggestion-number">{String(index + 1).padStart(2, "0")}</div>
             <div className="suggestion-body">
-              <div className="suggestion-meta"><span>{suggestion.dimension}</span><i>{suggestion.priority} impact</i></div>
+              <div className="suggestion-meta"><span>{t(suggestion.dimension)}</span><i>{t("{priority} impact", { priority: t(suggestion.priority) })}</i></div>
               <h3>{suggestion.title}</h3>
-              <div className="teaching-layer term-layer"><small>Art term</small><strong>{suggestion.technical_term}</strong></div>
-              <div className="teaching-layer plain-layer"><small>In plain language</small><p>{suggestion.plain_explanation}</p></div>
-              <div className="goal-line"><Target size={15} /><div><small>Goal</small><strong>{suggestion.goal}</strong></div></div>
-              <div className="steps-block"><small>Try this</small><ol>{suggestion.steps.map((step) => <li key={step}>{step}</li>)}</ol></div>
+              <div className="teaching-layer term-layer"><small>{t("Art term")}</small><strong>{suggestion.technical_term}</strong></div>
+              <div className="teaching-layer plain-layer"><small>{t("In plain language")}</small><p>{suggestion.plain_explanation}</p></div>
+              <div className="goal-line"><Target size={15} /><div><small>{t("Goal")}</small><strong>{suggestion.goal}</strong></div></div>
+              <div className="steps-block"><small>{t("Try this")}</small><ol>{suggestion.steps.map((step) => <li key={step}>{step}</li>)}</ol></div>
               <div className="feedback-row" onClick={(event) => event.stopPropagation()}>
-                <small>Was this useful?</small>
-                <button className={props.feedback[suggestion.id] === "useful" ? "selected" : ""} onClick={() => props.sendFeedback(suggestion.id, "useful")}><ThumbsUp size={14} /> Yes</button>
-                <button className={props.feedback[suggestion.id] === "not_useful" ? "selected" : ""} onClick={() => props.sendFeedback(suggestion.id, "not_useful")}><ThumbsDown size={14} /> No</button>
-                <button className={props.feedback[suggestion.id] === "intentional" ? "selected" : ""} onClick={() => props.setIntentionalTarget(suggestion.id)}><Target size={14} /> Intentional</button>
+                <small>{t("Was this useful?")}</small>
+                <button className={props.feedback[suggestion.id] === "useful" ? "selected" : ""} onClick={() => props.sendFeedback(suggestion.id, "useful")}><ThumbsUp size={14} /> {" "}{t("Yes")}</button>
+                <button className={props.feedback[suggestion.id] === "not_useful" ? "selected" : ""} onClick={() => props.sendFeedback(suggestion.id, "not_useful")}><ThumbsDown size={14} /> {" "}{t("No")}</button>
+                <button className={props.feedback[suggestion.id] === "intentional" ? "selected" : ""} onClick={() => props.setIntentionalTarget(suggestion.id)}><Target size={14} /> {" "}{t("Intentional")}</button>
               </div>
               {props.intentionalTarget === suggestion.id && (
                 <div className="intentional-form" onClick={(event) => event.stopPropagation()}>
-                  <textarea value={props.intentionalReason} onChange={(event) => props.setIntentionalReason(event.target.value)} placeholder="Why is this choice intentional? This becomes valuable training data." rows={3} />
-                  <button onClick={() => props.sendFeedback(suggestion.id, "intentional", props.intentionalReason)}>Save reasoning</button>
+                  <textarea value={props.intentionalReason} onChange={(event) => props.setIntentionalReason(event.target.value)} placeholder={t("Why is this choice intentional? This becomes valuable training data.")} rows={3} />
+                  <button onClick={() => props.sendFeedback(suggestion.id, "intentional", props.intentionalReason)}>{t("Save reasoning")}</button>
                 </div>
               )}
             </div>
@@ -948,7 +1100,7 @@ function CritiquePanel(props: CritiquePanelProps) {
 
       <section className="exercise-card">
         <div className="exercise-icon"><PenLine size={20} /></div>
-        <div><p className="eyebrow">Targeted practice · {result.exercise.duration_minutes} min</p><h3>{result.exercise.title}</h3><ol>{result.exercise.instructions.map((step) => <li key={step}>{step}</li>)}</ol><p className="success-signal"><Target size={15} /><span><strong>Success looks like:</strong> {result.exercise.success_signal}</span></p></div>
+        <div><p className="eyebrow">{t("Targeted practice · {minutes} min", { minutes: result.exercise.duration_minutes })}</p><h3>{result.exercise.title}</h3><ol>{result.exercise.instructions.map((step) => <li key={step}>{step}</li>)}</ol><p className="success-signal"><Target size={15} /><span><strong>{t("Success looks like:")}</strong> {result.exercise.success_signal}</span></p></div>
       </section>
     </div>
   );

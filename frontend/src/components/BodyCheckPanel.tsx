@@ -1,3 +1,4 @@
+import { useLocale } from "../i18n";
 import { useState } from "react";
 import { GitCompareArrows, ScanLine } from "lucide-react";
 import type { Project } from "../types";
@@ -11,19 +12,20 @@ interface Props {
 }
 
 export default function BodyCheckPanel({ project, pose3dEnabled, onError }: Props) {
+  const { t } = useLocale();
   const [mode, setMode] = useState<"artwork" | "reference">("artwork");
 
   return (
     <section className="body-check-shell">
-      <nav className="body-check-modes" aria-label="Body check mode">
+      <nav className="body-check-modes" aria-label={t("Body check mode")}>
         <button
           type="button"
           className={mode === "artwork" ? "active" : ""}
           onClick={() => setMode("artwork")}
         >
           <ScanLine size={15} />
-          Artwork self-check
-          <small>No reference</small>
+          {t("Artwork self-check")}
+          <small>{t("No reference")}</small>
         </button>
         <button
           type="button"
@@ -31,8 +33,8 @@ export default function BodyCheckPanel({ project, pose3dEnabled, onError }: Prop
           onClick={() => setMode("reference")}
         >
           <GitCompareArrows size={15} />
-          Reference comparison
-          <small>More precise</small>
+          {t("Reference comparison")}
+          <small>{t("More precise")}</small>
         </button>
       </nav>
       {mode === "artwork" ? (

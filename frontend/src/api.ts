@@ -18,6 +18,7 @@ import type {
   SampleArtwork,
 } from "./types";
 import { authAccessToken } from "./auth";
+import { currentLocale } from "./locale";
 
 // 生产环境前后端同域使用 /api；本地也可通过 Vite 环境变量连接独立后端。
 const API_ROOT = import.meta.env.VITE_API_URL ?? "/api";
@@ -39,6 +40,7 @@ export function assetUrl(path: string): string {
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   // 所有接口共享同一套请求与错误处理，泛型 T 让调用方得到正确的 TypeScript 类型。
   const headers = new Headers(init?.headers);
+  headers.set("Accept-Language", currentLocale());
   const accessCode = sessionStorage.getItem(ACCESS_CODE_KEY);
   if (accessCode) headers.set("X-ArtMentor-Access-Code", accessCode);
   // Session exchange and destructive account operations require a fresh Supabase
@@ -56,8 +58,8 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     let message = `Request failed (${response.status})`;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) message = body.detail;
+      const body = (await response.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") message = body.detail;
     } catch {
       // 非 JSON 错误仍保留 HTTP 状态，便于前端展示。
     }
@@ -88,6 +90,7 @@ export interface SessionStatus {
 
 async function downloadAccountExport(): Promise<void> {
   const headers = new Headers();
+  headers.set("Accept-Language", currentLocale());
   const accessCode = sessionStorage.getItem(ACCESS_CODE_KEY);
   if (accessCode) headers.set("X-ArtMentor-Access-Code", accessCode);
   const accessToken = await authAccessToken();
@@ -99,8 +102,8 @@ async function downloadAccountExport(): Promise<void> {
   if (!response.ok) {
     let message = `Export failed (${response.status})`;
     try {
-      const body = (await response.json()) as { detail?: string };
-      if (body.detail) message = body.detail;
+      const body = (await response.json()) as { detail?: unknown };
+      if (typeof body.detail === "string") message = body.detail;
     } catch {
       // Preserve the status-based fallback for non-JSON errors.
     }

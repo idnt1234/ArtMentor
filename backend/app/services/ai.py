@@ -9,7 +9,8 @@ import base64
 import json
 import logging
 from dataclasses import dataclass
-from typing import Any, TypeVar
+from functools import partial
+from typing import Any, Literal, TypeVar
 
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
@@ -29,13 +30,17 @@ from ..schemas import (
 )
 
 
+FeedbackLocale = Literal["en", "zh-CN"]
+
+DEFAULT_LANGUAGE_RULE = """- Match the language of the artist's confirmed intent. If it is Chinese, use natural
+  Simplified Chinese. If the language is unclear, use English."""
+
 # 所有生成任务共用的表达规则：保留必要术语，但必须紧跟白话、原因和修改目标。
-COMMUNICATION_RULES = """
+COMMUNICATION_RULES = f"""
 Write for an intermediate artist, not an art director or design-school critic. The goal is
 fast understanding, not impressive vocabulary.
 
-- Match the language of the artist's confirmed intent. If it is Chinese, use natural
-  Simplified Chinese. If the language is unclear, use English.
+{DEFAULT_LANGUAGE_RULE}
 - Use a technical term only when it makes the advice more precise. Explain it immediately in
   ordinary language. Never stack several technical terms in one sentence.
 - Use short sentences. Put one idea in each sentence. Prefer visible facts such as "the black
@@ -64,6 +69,7 @@ artwork yet. Separate directly visible facts from interpretations.
 Action grounding rules:
 - visual_observations must describe only visible pose, contact, direction, or overlap. Do not put
   an action label such as saluting, adjusting headphones, attacking, or dancing in this field.
+  Return at most four short observations, with the most useful evidence first.
 - Use action_status=clear only when one action is strongly supported by visible evidence.
 - If two or more actions are plausible, use ambiguous and return up to three short hypotheses.
 - If evidence is insufficient, use unknown. If there is no acting figure, use not_applicable.
@@ -197,6 +203,19 @@ logger = logging.getLogger(__name__)
 SchemaModel = TypeVar("SchemaModel", bound=BaseModel)
 
 
+def _localized_system_prompt(prompt: str, locale: FeedbackLocale | None) -> str:
+    if locale is None:
+        return prompt
+    language = "Simplified Chinese" if locale == "zh-CN" else "English"
+    rule = (
+        f"- Write all user-facing prose in {language}.\n"
+        "  Preserve JSON keys, enum values, and canonical stage names exactly as specified.\n"
+        "  Keep identifiers, numbers, and coordinates in the required format. Keep reference search_terms in English.\n"
+        "  Preserve the artist's original wording when quoting it."
+    )
+    return prompt.replace(DEFAULT_LANGUAGE_RULE, rule, 1)
+
+
 # 第三方 Chat Completions 不能直接使用 Pydantic 解析，因此把目标 JSON 形状写进 Prompt。
 CHAT_OUTPUT_SHAPES = {
     "IntentCore": (
@@ -285,159 +304,341 @@ def _message_text(content: Any) -> str:
     raise ValueError("The model returned an empty or unsupported message.")
 
 
-def _demo_intent(intent: str, style: str, stage: str) -> IntentCore:
+def _validation_issues(exc: ValidationError) -> list[str]:
+    """只返回字段路径和错误类型，不把模型原文或用户内容写入日志。"""
+    issues: list[str] = []
+    for error in exc.errors(include_input=False)[:8]:
+        location = ".".join(str(part) for part in error["loc"]) or "$"
+        issues.append(f"{location}:{error['type']}")
+    return issues
+
+
+def _trim_extra_intent_observations(
+    payload: str, exc: ValidationError
+) -> dict[str, Any] | None:
+    """仅在观察条目过多且其余内容有效时，保留模型排在最前面的观察。"""
+    errors = exc.errors(include_input=False)
+    if len(errors) != 1:
+        return None
+    error = errors[0]
+    if error["loc"] != ("visual_observations",) or error["type"] != "too_long":
+        return None
+
+    data = json.loads(payload)
+    observations = data["visual_observations"]
+    if not all(isinstance(item, str) for item in observations):
+        return None
+    data["visual_observations"] = observations[: error["ctx"]["max_length"]]
+    return data
+
+
+def _validate_gateway_json(
+    schema_type: type[SchemaModel], payload: str
+) -> SchemaModel:
+    """校验模型返回的 JSON，容忍意图观察条目超限。"""
+    try:
+        return schema_type.model_validate_json(payload)
+    except ValidationError as exc:
+        if schema_type is IntentCore:
+            trimmed = _trim_extra_intent_observations(payload, exc)
+            if trimmed is not None:
+                result = schema_type.model_validate(trimmed)
+                logger.warning("AI intent observations capped: provider=gptsapi")
+                return result
+        issues = _validation_issues(exc)
+        raise ProviderFormatError(f"schema_mismatch[{','.join(issues)}]") from exc
+
+
+def _demo_text(locale: FeedbackLocale | None, english: str, chinese: str) -> str:
+    return chinese if locale == "zh-CN" else english
+
+
+def _demo_intent(
+    intent: str, style: str, stage: str, locale: FeedbackLocale | None = None
+) -> IntentCore:
     """生成固定的意图复述，供无密钥开发和自动化测试使用。"""
+    text = partial(_demo_text, locale)
     return IntentCore(
-        restatement=(
+        restatement=text(
             f"You want this {stage.lower()} {style} illustration to communicate “{intent.strip()}” "
-            "while keeping the visual choices intentional and readable."
+            "while keeping the visual choices intentional and readable.",
+            f"你希望这幅采用“{style}”风格、处于“{stage}”阶段的插画传达“{intent.strip()}”，并让观众看懂这些画面安排。",
         ),
         assumptions=[
-            "The stated style is intentional and should be preserved.",
-            "Feedback should prioritize the next revision rather than a full repaint.",
+            text(
+                "The stated style is intentional and should be preserved.",
+                "你选择的风格有明确用意，值得保留。",
+            ),
+            text(
+                "Feedback should prioritize the next revision rather than a full repaint.",
+                "建议以这一轮能完成的修改为主。",
+            ),
         ],
-        confirmation_question="Does this capture what you want the viewer to feel and notice first?",
+        confirmation_question=text(
+            "Does this capture what you want the viewer to feel and notice first?",
+            "这符合你希望观众产生的感受，以及他们第一眼该看到的内容吗？",
+        ),
         visual_observations=[],
         action_status="unknown",
         action_hypotheses=[],
-        action_question="If the figure is performing a specific action, what should it be read as?",
+        action_question=text(
+            "If the figure is performing a specific action, what should it be read as?",
+            "如果人物正在做某个具体动作，你希望观众看出什么动作？",
+        ),
         stage_assessment="consistent",
         suggested_stage=stage,
-        stage_note=f"The artist declared this work as {stage}; offline mode cannot visually verify it.",
+        stage_note=text(
+            f"The artist declared this work as {stage}; offline mode cannot visually verify it.",
+            f"你将作品阶段设为“{stage}”。离线模式无法根据画面核对这一阶段。",
+        ),
     )
 
 
-def _demo_critique(intent: str, metrics: VisualMetrics) -> CritiqueCore:
+def _demo_critique(
+    intent: str, metrics: VisualMetrics, locale: FeedbackLocale | None = None
+) -> CritiqueCore:
     """根据少量确定性指标生成完整点评结构，不调用任何外部模型。"""
+    text = partial(_demo_text, locale)
     contrast_score = 7 if metrics.value_contrast > 0.35 else 5
     color_score = 7 if 0.18 < metrics.mean_saturation < 0.72 else 5
     return CritiqueCore(
         intent_restatement=intent,
-        overall_read=(
+        overall_read=text(
             "The image has a coherent atmosphere and a readable primary idea. Its next gain will come "
-            "from making the focal hierarchy more decisive, then simplifying nearby competition."
+            "from making the focal hierarchy more decisive, then simplifying nearby competition.",
+            "画面的氛围统一，主要想法容易看懂。下一步可以突出视觉重点，再简化周围抢眼的细节。",
         ),
         strengths=[
-            "The broad shape grouping creates an immediate first read.",
-            "The palette feels related rather than assembled from isolated colors.",
+            text(
+                "The broad shape grouping creates an immediate first read.",
+                "大形组织清楚，第一眼就能看出画面的基本关系。",
+            ),
+            text(
+                "The palette feels related rather than assembled from isolated colors.",
+                "各处颜色相互呼应，整体色调统一。",
+            ),
         ],
         dimensions=[
             DimensionAnalysis(
                 dimension="composition",
                 score=6,
-                headline="Clear structure, with a slightly divided focal hierarchy",
+                headline=text(
+                    "Clear structure, with a slightly divided focal hierarchy",
+                    "画面结构清楚，视觉重点略显分散",
+                ),
                 observations=[
-                    "The main mass is readable at thumbnail size.",
-                    "Secondary edge activity competes with the intended focal area.",
+                    text(
+                        "The main mass is readable at thumbnail size.",
+                        "缩成小图后，主体的大形仍然容易辨认。",
+                    ),
+                    text(
+                        "Secondary edge activity competes with the intended focal area.",
+                        "次要区域有些边缘太抢眼，分散了观众对重点的注意。",
+                    ),
                 ],
             ),
             DimensionAnalysis(
                 dimension="value",
                 score=contrast_score,
-                headline="The value family is coherent but could separate the focal plane more strongly",
+                headline=text(
+                    "The value family is coherent but could separate the focal plane more strongly",
+                    "整体明暗统一，主体所在区域还可以更突出",
+                ),
                 observations=[
-                    f"Measured value contrast is {metrics.value_contrast:.2f} on the normalized scale.",
-                    "A small local contrast change would work better than increasing contrast everywhere.",
+                    text(
+                        f"Measured value contrast is {metrics.value_contrast:.2f} on the normalized scale.",
+                        f"画面的明暗对比指标为 {metrics.value_contrast:.2f}（范围 0 到 1）。",
+                    ),
+                    text(
+                        "A small local contrast change would work better than increasing contrast everywhere.",
+                        "可以小幅拉开主体附近的明暗，让主体和背景更容易区分。",
+                    ),
                 ],
             ),
             DimensionAnalysis(
                 dimension="color",
                 score=color_score,
-                headline="The palette is cohesive; emphasis can be more selective",
+                headline=text(
+                    "The palette is cohesive; emphasis can be more selective",
+                    "色调统一，重点区域的配色可以更鲜明",
+                ),
                 observations=[
-                    f"Mean saturation is {metrics.mean_saturation:.2f}.",
-                    "Reserve the clearest temperature or saturation contrast for the story beat.",
+                    text(
+                        f"Mean saturation is {metrics.mean_saturation:.2f}.",
+                        f"平均饱和度为 {metrics.mean_saturation:.2f}。",
+                    ),
+                    text(
+                        "Reserve the clearest temperature or saturation contrast for the story beat.",
+                        "把最明显的冷暖或饱和度对比留给故事里的关键细节。",
+                    ),
                 ],
             ),
             DimensionAnalysis(
                 dimension="narrative",
                 score=6,
-                headline="The mood reads before the specific story beat",
+                headline=text(
+                    "The mood reads before the specific story beat",
+                    "观众先感受到氛围，再读到具体情节",
+                ),
                 observations=[
-                    "The atmosphere is legible without explanation.",
-                    "One clearer directional cue could connect the subject to the key event.",
+                    text(
+                        "The atmosphere is legible without explanation.",
+                        "观众从画面本身就能感受到氛围。",
+                    ),
+                    text(
+                        "One clearer directional cue could connect the subject to the key event.",
+                        "可以用更清楚的方向提示，引导观众从主体看到关键情节。",
+                    ),
                 ],
             ),
         ],
         suggestions=[
             SuggestionDraft(
                 dimension="composition",
-                title="Make the subject the first thing viewers notice",
-                technical_term="Visual hierarchy",
-                plain_explanation="Several sharp, busy areas compete with the subject, so the eye has no clear first stop.",
-                goal="Viewers should notice the subject before nearby details.",
+                title=text(
+                    "Make the subject the first thing viewers notice",
+                    "让观众第一眼先看到主体",
+                ),
+                technical_term=text("Visual hierarchy", "主次关系"),
+                plain_explanation=text(
+                    "Several sharp, busy areas compete with the subject, so the eye has no clear first stop.",
+                    "几处细节密集的区域边缘太清晰，和主体一样抢眼，观众很难一眼找到重点。",
+                ),
+                goal=text(
+                    "Viewers should notice the subject before nearby details.",
+                    "让观众先看到主体，再看到周围的细节。",
+                ),
                 steps=[
-                    "Soften or merge two secondary edge clusters.",
-                    "Keep the sharpest boundary on the subject.",
+                    text(
+                        "Soften or merge two secondary edge clusters.",
+                        "选两处次要细节，柔化或合并那里的边缘。",
+                    ),
+                    text(
+                        "Keep the sharpest boundary on the subject.",
+                        "把最清晰的边缘留在主体上。",
+                    ),
                 ],
                 priority="high",
                 region=Rect(x=0.42, y=0.23, width=0.34, height=0.38),
             ),
             SuggestionDraft(
                 dimension="value",
-                title="Separate the subject from its background",
-                technical_term="Local light-dark contrast",
-                plain_explanation="The subject and the area behind it are similarly bright, so their shapes blend together.",
-                goal="The subject's outline should remain clear when the image is viewed small.",
+                title=text(
+                    "Separate the subject from its background", "把主体从背景里区分出来"
+                ),
+                technical_term=text("Local light-dark contrast", "局部明暗对比"),
+                plain_explanation=text(
+                    "The subject and the area behind it are similarly bright, so their shapes blend together.",
+                    "主体和背后的区域亮度相近，轮廓容易混在一起。",
+                ),
+                goal=text(
+                    "The subject's outline should remain clear when the image is viewed small.",
+                    "缩小画面后，仍能看清主体的轮廓。",
+                ),
                 steps=[
-                    "Check the image in grayscale.",
-                    "Make only the nearby background one step lighter or darker.",
+                    text(
+                        "Check the image in grayscale.",
+                        "把画面转成灰度，检查主体周围的明暗。",
+                    ),
+                    text(
+                        "Make only the nearby background one step lighter or darker.",
+                        "把紧贴主体的背景调亮或调暗一档。",
+                    ),
                 ],
                 priority="high",
                 region=Rect(x=0.28, y=0.31, width=0.32, height=0.42),
             ),
             SuggestionDraft(
                 dimension="narrative",
-                title="Guide the eye toward the key story moment",
-                technical_term="Eye path",
-                plain_explanation="The first subject is visible, but the viewer has no clear place to look next.",
-                goal="The intended story detail should become the viewer's second stop.",
+                title=text(
+                    "Guide the eye toward the key story moment", "把视线引向关键情节"
+                ),
+                technical_term=text("Eye path", "视线引导"),
+                plain_explanation=text(
+                    "The first subject is visible, but the viewer has no clear place to look next.",
+                    "观众能看到主体，接着却不容易找到值得看的地方。",
+                ),
+                goal=text(
+                    "The intended story detail should become the viewer's second stop.",
+                    "让观众看过主体后，接着注意到关键情节。",
+                ),
                 steps=[
-                    "Choose one gesture, light path, or repeated shape.",
-                    "Point it toward the intended story detail.",
+                    text(
+                        "Choose one gesture, light path, or repeated shape.",
+                        "选一个有方向的动作、光带或一组重复的形状。",
+                    ),
+                    text(
+                        "Point it toward the intended story detail.",
+                        "让它指向你希望观众注意的情节细节。",
+                    ),
                 ],
                 priority="medium",
                 region=Rect(x=0.58, y=0.52, width=0.3, height=0.3),
             ),
         ],
         exercise=Exercise(
-            title="Three-value focal hierarchy study",
+            title=text("Three-value focal hierarchy study", "用三档明暗练习突出重点"),
             duration_minutes=15,
             instructions=[
-                "Duplicate the artwork and reduce it to three flat values.",
-                "Make three tiny variants with a different dominant value group.",
-                "Choose the variant where the intended focal point reads first at 10% zoom.",
+                text(
+                    "Duplicate the artwork and reduce it to three flat values.",
+                    "复制作品，只用亮、中、暗三档概括画面。",
+                ),
+                text(
+                    "Make three tiny variants with a different dominant value group.",
+                    "画三张小图，每张分别以亮调、中间调或暗调为主。",
+                ),
+                text(
+                    "Choose the variant where the intended focal point reads first at 10% zoom.",
+                    "缩放到 10%，选出最容易一眼看到预定重点的那张。",
+                ),
             ],
-            success_signal="A viewer can name the first focal area in under two seconds without reading the intent.",
+            success_signal=text(
+                "A viewer can name the first focal area in under two seconds without reading the intent.",
+                "观众没看过创作意图，也能在两秒内指出你希望他们第一眼看到的地方。",
+            ),
         ),
         reference_goals=[
             ReferenceGoal(
                 dimension="composition",
                 search_terms="strong scale and focal hierarchy",
-                rationale="Study how one large directional shape controls the entry path and protects a small focal point.",
+                rationale=text(
+                    "Study how one large directional shape controls the entry path and protects a small focal point.",
+                    "看看有方向感的大形如何引导视线，让画面里较小的重点也能被看见。",
+                ),
             ),
             ReferenceGoal(
                 dimension="value",
                 search_terms="portrait local value contrast",
-                rationale="Notice how restrained surrounding values make a small illuminated accent feel decisive.",
+                rationale=text(
+                    "Notice how restrained surrounding values make a small illuminated accent feel decisive.",
+                    "注意周围的明暗如何保持克制，衬出那一小块亮部。",
+                ),
             ),
             ReferenceGoal(
                 dimension="color",
                 search_terms="expressive limited night palette",
-                rationale="Compare how temperature contrast and repeated color rhythm can carry emotion without equal saturation everywhere.",
+                rationale=text(
+                    "Compare how temperature contrast and repeated color rhythm can carry emotion without equal saturation everywhere.",
+                    "观察冷暖对比和重复出现的颜色如何传达情绪，以及饱和度集中在了哪些地方。",
+                ),
             ),
         ],
     )
 
 
-def _demo_comparison(before: VisualMetrics, after: VisualMetrics) -> ComparisonCore:
+def _demo_comparison(
+    before: VisualMetrics, after: VisualMetrics, locale: FeedbackLocale | None = None
+) -> ComparisonCore:
     """用前后指标差异生成可重复的演示对比报告。"""
+    text = partial(_demo_text, locale)
     contrast_delta = after.value_contrast - before.value_contrast
     saturation_delta = after.mean_saturation - before.mean_saturation
     return ComparisonCore(
-        summary=(
+        summary=text(
             "The revision makes a visible attempt to clarify the focal hierarchy. The strongest change is local contrast; "
-            "the narrative effect is plausible but still benefits from a human judgment call."
+            "the narrative effect is plausible but still benefits from a human judgment call.",
+            "修改版尝试让画面的主次更清楚，局部对比的变化最明显。情节有没有更清楚，可以请观众看过两版后再判断。",
         ),
         changes=[
             ChangeAssessment(
@@ -445,29 +646,56 @@ def _demo_comparison(before: VisualMetrics, after: VisualMetrics) -> ComparisonC
                 outcome="improved"
                 if after.thirds_distance < before.thirds_distance
                 else "tradeoff",
-                explanation="The edge-weighted center of attention moved relative to the thirds intersections.",
-                evidence=f"Thirds distance changed from {before.thirds_distance:.2f} to {after.thirds_distance:.2f}.",
+                explanation=text(
+                    "The edge-weighted center of attention moved relative to the thirds intersections.",
+                    "按边缘分布估算的视觉中心，相对三分线交点的位置发生了变化。",
+                ),
+                evidence=text(
+                    f"Thirds distance changed from {before.thirds_distance:.2f} to {after.thirds_distance:.2f}.",
+                    f"视觉中心到最近三分线交点的距离指标从 {before.thirds_distance:.2f} 变为 {after.thirds_distance:.2f}。",
+                ),
             ),
             ChangeAssessment(
                 dimension="value",
                 outcome="improved" if contrast_delta > 0.03 else "unchanged",
-                explanation="The revision changes global value separation, though local inspection remains important.",
-                evidence=f"Normalized contrast changed by {contrast_delta:+.2f}.",
+                explanation=text(
+                    "The revision changes global value separation, though local inspection remains important.",
+                    "修改后画面的整体明暗对比有变化。也可以放大重点区域，看看局部是否更容易辨认。",
+                ),
+                evidence=text(
+                    f"Normalized contrast changed by {contrast_delta:+.2f}.",
+                    f"明暗对比指标变化了 {contrast_delta:+.2f}。",
+                ),
             ),
             ChangeAssessment(
                 dimension="color",
                 outcome="tradeoff" if abs(saturation_delta) > 0.04 else "unchanged",
-                explanation="The saturation shift changes emphasis and atmosphere rather than being inherently better or worse.",
-                evidence=f"Mean saturation changed by {saturation_delta:+.2f}.",
+                explanation=text(
+                    "The saturation shift changes emphasis and atmosphere rather than being inherently better or worse.",
+                    "饱和度的变化会改变画面的氛围和重点。可以对照创作意图判断哪版更合适。",
+                ),
+                evidence=text(
+                    f"Mean saturation changed by {saturation_delta:+.2f}.",
+                    f"平均饱和度变化了 {saturation_delta:+.2f}。",
+                ),
             ),
             ChangeAssessment(
                 dimension="narrative",
                 outcome="uncertain",
-                explanation="The intended story beat needs a viewer judgment beyond global image statistics.",
-                evidence="Use the side-by-side view and the original intent to confirm the second visual stop.",
+                explanation=text(
+                    "The intended story beat needs a viewer judgment beyond global image statistics.",
+                    "全图统计只能反映画面的整体特征。情节是否清楚，要看观众实际读到了什么。",
+                ),
+                evidence=text(
+                    "Use the side-by-side view and the original intent to confirm the second visual stop.",
+                    "并排对照两版和创作意图，确认观众看完主体后，接着会看哪里。",
+                ),
             ),
         ],
-        next_step="Show both versions at thumbnail size to three viewers and ask what they notice first and second.",
+        next_step=text(
+            "Show both versions at thumbnail size to three viewers and ask what they notice first and second.",
+            "把两版都缩成小图给三位观众看，问他们第一眼和第二眼分别看到了什么。",
+        ),
     )
 
 
@@ -529,21 +757,19 @@ class ArtMentorAI:
         except ValueError as exc:
             raise ProviderFormatError("unreadable_message_content") from exc
         try:
-            # 第三方网关偶尔会把英文弯引号解码成替换字符；产品界面为全英文，可安全归一化。
+            # 兼容第三方网关偶发的英文弯引号解码错误。
             payload = _extract_json_object(raw).replace("\ufffd", "'")
         except ValueError as exc:
             raise ProviderFormatError("missing_json_object") from exc
-        try:
-            return schema_type.model_validate_json(payload)
-        except ValidationError as exc:
-            # 仅保留字段路径和错误类型，避免把模型输出或用户内容写入日志。
-            issues = [
-                f"{'.'.join(str(part) for part in error['loc'])}:{error['type']}"
-                for error in exc.errors(include_input=False)[:8]
-            ]
-            raise ProviderFormatError(f"schema_mismatch[{','.join(issues)}]") from exc
+        return _validate_gateway_json(schema_type, payload)
 
-    def _fallback(self, value: object, exc: Exception | None = None) -> ProviderResult:
+    def _fallback(
+        self,
+        value: object,
+        exc: Exception | None = None,
+        *,
+        locale: FeedbackLocale | None = None,
+    ) -> ProviderResult:
         """本地演示可回退到确定性结果；生产环境关闭回退以暴露真实故障。"""
         if not self.settings.allow_demo_fallback:
             if exc:
@@ -567,12 +793,17 @@ class ArtMentorAI:
                 code,
             )
         provider_label = "WildAI / GPTsAPI" if self.provider == "gptsapi" else "OpenAI"
-        state = "was unavailable" if exc else "is not configured"
+        if locale == "zh-CN":
+            state = "暂不可用" if exc else "尚未配置"
+            warning = f"{provider_label} {state}{detail}，当前显示固定的演示点评。"
+        else:
+            state = "was unavailable" if exc else "is not configured"
+            warning = f"{provider_label} {state}{detail}; showing deterministic demo feedback."
         return ProviderResult(
             value=value,
             provider="demo",
             model="deterministic-v1",
-            warning=f"{provider_label} {state}{detail}; showing deterministic demo feedback.",
+            warning=warning,
         )
 
     def restate_intent(
@@ -582,11 +813,14 @@ class ArtMentorAI:
         stage: str,
         image: bytes | None = None,
         mime: str = "image/jpeg",
+        *,
+        locale: FeedbackLocale | None = None,
     ) -> ProviderResult:
         """看图核对可见事实、动作不确定性与阶段，再复述创作目标。"""
-        demo = _demo_intent(intent, style, stage)
+        demo = _demo_intent(intent, style, stage, locale)
         if not self.client:
-            return self._fallback(demo)
+            return self._fallback(demo, locale=locale)
+        system_prompt = _localized_system_prompt(CONTEXT_AUDIT_SYSTEM_PROMPT, locale)
         context_text = f"Declared stage: {stage}\nStyle: {style}\nArtist intent: {intent}"
         try:
             if self.provider == "gptsapi":
@@ -601,7 +835,7 @@ class ArtMentorAI:
                     ]
                 value = self._chat_json(
                     IntentCore,
-                    CONTEXT_AUDIT_SYSTEM_PROMPT,
+                    system_prompt,
                     user_content,
                     max_tokens=2200,
                 )
@@ -620,14 +854,14 @@ class ArtMentorAI:
                 model=self.settings.openai_model,
                 reasoning={"effort": self.settings.openai_reasoning_effort},
                 input=[
-                    {"role": "system", "content": CONTEXT_AUDIT_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 text_format=IntentCore,
             )
             return ProviderResult(response.output_parsed, self.provider, self.model)
         except Exception as exc:
-            return self._fallback(demo, exc)
+            return self._fallback(demo, exc, locale=locale)
 
     def critique(
         self,
@@ -638,12 +872,14 @@ class ArtMentorAI:
         stage: str,
         metrics: VisualMetrics,
         action_context: str | None = None,
+        *,
+        locale: FeedbackLocale | None = None,
     ) -> ProviderResult:
         """让视觉模型按四维点评图片，并返回可直接验证的 CritiqueCore。"""
         # 模型同时接收作品、确认后的意图与传统视觉指标；指标只作辅助证据。
-        demo = _demo_critique(intent, metrics)
+        demo = _demo_critique(intent, metrics, locale)
         if not self.client:
-            return self._fallback(demo)
+            return self._fallback(demo, locale=locale)
         action_rule = (
             f"Artist-confirmed action context: {action_context.strip()}"
             if action_context and action_context.strip()
@@ -652,9 +888,8 @@ class ArtMentorAI:
                 "describe only visible pose, contact, direction, or gesture."
             )
         )
-        critique_prompt = (
-            f"{CRITIQUE_SYSTEM_PROMPT}\n\n{_stage_rubric(stage)}\n\n{action_rule}"
-        )
+        system_prompt = _localized_system_prompt(CRITIQUE_SYSTEM_PROMPT, locale)
+        critique_prompt = f"{system_prompt}\n\n{_stage_rubric(stage)}\n\n{action_rule}"
         try:
             if self.provider == "gptsapi":
                 value = self._chat_json(
@@ -706,7 +941,7 @@ class ArtMentorAI:
             )
             return ProviderResult(response.output_parsed, self.provider, self.model)
         except Exception as exc:
-            return self._fallback(demo, exc)
+            return self._fallback(demo, exc, locale=locale)
 
     def compare(
         self,
@@ -717,16 +952,19 @@ class ArtMentorAI:
         intent: str,
         before_metrics: VisualMetrics,
         after_metrics: VisualMetrics,
+        *,
+        locale: FeedbackLocale | None = None,
     ) -> ProviderResult:
         """以同一创作意图比较原图与修改版，输出四维变化和下一步。"""
-        demo = _demo_comparison(before_metrics, after_metrics)
+        demo = _demo_comparison(before_metrics, after_metrics, locale)
         if not self.client:
-            return self._fallback(demo)
+            return self._fallback(demo, locale=locale)
+        system_prompt = _localized_system_prompt(COMPARISON_SYSTEM_PROMPT, locale)
         try:
             if self.provider == "gptsapi":
                 value = self._chat_json(
                     ComparisonCore,
-                    COMPARISON_SYSTEM_PROMPT,
+                    system_prompt,
                     [
                         {
                             "type": "text",
@@ -754,7 +992,7 @@ class ArtMentorAI:
                 model=self.settings.openai_model,
                 reasoning={"effort": self.settings.openai_reasoning_effort},
                 input=[
-                    {"role": "system", "content": COMPARISON_SYSTEM_PROMPT},
+                    {"role": "system", "content": system_prompt},
                     {
                         "role": "user",
                         "content": [
@@ -779,4 +1017,4 @@ class ArtMentorAI:
             )
             return ProviderResult(response.output_parsed, self.provider, self.model)
         except Exception as exc:
-            return self._fallback(demo, exc)
+            return self._fallback(demo, exc, locale=locale)

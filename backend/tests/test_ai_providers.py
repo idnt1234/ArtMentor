@@ -1,4 +1,8 @@
+import json
 from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
 
 from app.config import Settings
 from app.schemas import IntentCore, SuggestionDraft, VisualMetrics
@@ -6,7 +10,10 @@ from app.services.ai import (
     CONTEXT_AUDIT_SYSTEM_PROMPT,
     CRITIQUE_SYSTEM_PROMPT,
     ArtMentorAI,
+    ProviderFormatError,
+    _demo_comparison,
     _demo_critique,
+    _demo_intent,
     _stage_rubric,
 )
 
@@ -92,6 +99,7 @@ def test_gptsapi_uses_chat_completions_for_structured_intent() -> None:
     assert completions.calls[0]["response_format"] == {"type": "json_object"}
     assert "Required JSON shape" in completions.calls[0]["messages"][0]["content"]
     assert "Separate directly visible facts" in completions.calls[0]["messages"][0]["content"]
+    assert "Match the language of the artist's confirmed intent" in completions.calls[0]["messages"][0]["content"]
     audit_content = completions.calls[0]["messages"][1]["content"]
     assert audit_content[1]["type"] == "image_url"
 
@@ -124,6 +132,60 @@ def test_gptsapi_critique_sends_standard_vision_content() -> None:
     assert "Artist-confirmed action context" in system_prompt
 
 
+@pytest.mark.parametrize("provider", ["gptsapi", "openai"])
+@pytest.mark.parametrize(
+    ("locale", "language"), [("en", "English"), ("zh-CN", "Simplified Chinese")]
+)
+def test_feedback_locale_reaches_every_provider_prompt(
+    provider: str, locale: str, language: str
+) -> None:
+    service = ArtMentorAI(
+        Settings(
+            ai_provider=provider, gptsapi_key="test-only", openai_api_key="test-only"
+        )
+    )
+    intent = "安静的肖像 Quiet portrait"
+    metrics = _metrics()
+    for generate, args, payload in [
+        (
+            service.restate_intent,
+            (intent, "Painterly", "Sketch"),
+            _demo_intent(intent, "Painterly", "Sketch"),
+        ),
+        (
+            service.critique,
+            (b"image", "image/png", intent, "Painterly", "Sketch", metrics),
+            _demo_critique(intent, metrics),
+        ),
+        (
+            service.compare,
+            (b"before", "image/png", b"after", "image/png", intent, metrics, metrics),
+            _demo_comparison(metrics, metrics),
+        ),
+    ]:
+        if provider == "gptsapi":
+            service.client, completions = _fake_client(payload.model_dump_json())
+        else:
+            parse = Mock(return_value=SimpleNamespace(output_parsed=payload))
+            service.client = SimpleNamespace(responses=SimpleNamespace(parse=parse))
+
+        result = generate(*args, locale=locale)
+
+        assert result.provider == provider
+        assert result.value == payload
+        messages = (
+            completions.calls[0]["messages"]
+            if provider == "gptsapi"
+            else parse.call_args.kwargs["input"]
+        )
+        content = messages[1]["content"]
+        assert intent in (content if isinstance(content, str) else content[0]["text"])
+        prompt = messages[0]["content"]
+        assert f"Write all user-facing prose in {language}." in prompt
+        assert "Match the language of the artist's confirmed intent" not in prompt
+        assert "Preserve JSON keys, enum values, and canonical stage names" in prompt
+
+
 def test_invalid_gateway_output_uses_labeled_demo_fallback() -> None:
     settings = Settings(
         ai_provider="gptsapi",
@@ -139,6 +201,61 @@ def test_invalid_gateway_output_uses_labeled_demo_fallback() -> None:
     assert result.provider == "demo"
     assert result.warning is not None
     assert "WildAI / GPTsAPI was unavailable" in result.warning
+
+
+def test_gateway_intent_keeps_the_first_four_valid_observations() -> None:
+    settings = Settings(
+        ai_provider="gptsapi", gptsapi_key="test-only", allow_demo_fallback=False
+    )
+    service = ArtMentorAI(settings)
+    observations = [
+        "右手抬到头侧。",
+        "手指与耳边物体重叠。",
+        "左臂垂在身体侧面。",
+        "头朝画面左侧转动。",
+        "肩膀略微倾斜。",
+    ]
+    payload = {
+        "restatement": "突出人物安静的神情。",
+        "assumptions": [],
+        "confirmation_question": "你希望观众先看脸部吗？",
+        "visual_observations": observations,
+        "action_status": "unknown",
+        "stage_assessment": "consistent",
+    }
+    service.client, _completions = _fake_client(json.dumps(payload, ensure_ascii=False))
+
+    result = service.restate_intent("突出人物安静的神情", "Painterly", "Sketch", locale="zh-CN")
+
+    assert result.provider == "gptsapi"
+    assert result.warning is None
+    assert result.value.visual_observations == observations[:4]
+    assert result.value.restatement == "突出人物安静的神情。"
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"visual_observations": ["The right hand is raised."] * 5 + [42]},
+        {"action_status": "probably"},
+    ],
+)
+def test_gateway_rejects_invalid_intent_despite_extra_observations(updates: dict) -> None:
+    settings = Settings(
+        ai_provider="gptsapi", gptsapi_key="test-only", allow_demo_fallback=False
+    )
+    service = ArtMentorAI(settings)
+    payload = {
+        "restatement": "A quiet portrait.",
+        "assumptions": [],
+        "confirmation_question": "Is the face the intended first read?",
+        "visual_observations": ["The right hand is raised."] * 5,
+    }
+    payload.update(updates)
+    service.client, _completions = _fake_client(json.dumps(payload))
+
+    with pytest.raises(ProviderFormatError, match="schema_mismatch"):
+        service.restate_intent("quiet warmth", "Painterly", "Sketch")
 
 
 def test_legacy_suggestion_is_upgraded_to_reader_first_structure() -> None:

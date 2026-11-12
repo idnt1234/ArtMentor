@@ -1,3 +1,4 @@
+import { useLocale } from "../i18n";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Image as KonvaImage, Layer, Rect as KonvaRect, Stage, Text, Transformer } from "react-konva";
 import type Konva from "konva";
@@ -24,6 +25,7 @@ export default function AnnotationCanvas({
   onActiveChange,
   onRegionChange,
 }: Props) {
+  const { t } = useLocale();
   const containerRef = useRef<HTMLDivElement>(null);
   const transformerRef = useRef<Konva.Transformer>(null);
   const shapeRefs = useRef<Record<string, Konva.Rect | null>>({});
@@ -139,7 +141,7 @@ export default function AnnotationCanvas({
           />
         </Layer>
       </Stage>
-      {suggestions.length > 0 && <div className="canvas-hint">Drag or resize a region to correct the AI annotation</div>}
+      {suggestions.length > 0 && <div className="canvas-hint">{t("Drag or resize a region to correct the AI annotation")}</div>}
     </div>
   );
 }

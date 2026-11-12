@@ -1,3 +1,5 @@
+import { useLocale } from "../i18n";
+import { translatePoseText } from "../pose-copy";
 import { useEffect, useMemo, useState } from "react";
 import { AlertTriangle, Check, GitCompareArrows, LoaderCircle, Upload, X } from "lucide-react";
 import { api, assetUrl } from "../api";
@@ -18,6 +20,8 @@ interface Props {
 }
 
 export default function PoseComparisonPanel({ project, onError }: Props) {
+  const { t, locale } = useLocale();
+  const reportText = (message: string) => translatePoseText(locale, message);
   const [comparison, setComparison] = useState<PoseComparison | null>(null);
   const [reference, setReference] = useState<File | null>(null);
   const [styleMode, setStyleMode] = useState<PoseStyleMode>("semi_realistic");
@@ -160,14 +164,13 @@ export default function PoseComparisonPanel({ project, onError }: Props) {
     return (
       <section className="pose-empty">
         <div className="pose-empty-icon"><GitCompareArrows size={28} /></div>
-        <p className="eyebrow">Reference-based body check</p>
-        <h2>Compare the drawing to a pose you trust.</h2>
+        <p className="eyebrow">{t("Reference-based body check")}</p>
+        <h2>{t("Compare the drawing to a pose you trust.")}</h2>
         <p>
-          This first version checks 2D joint placement, limb proportions and major joint
-          angles. It will not claim that a stylized body is objectively wrong.
+          {t("This first version checks 2D joint placement, limb proportions and major joint angles. It will not claim that a stylized body is objectively wrong.")}
         </p>
         <label>
-          <span>Reference photo or pose image</span>
+          <span>{t("Reference photo or pose image")}</span>
           <input
             type="file"
             accept="image/jpeg,image/png,image/webp"
@@ -175,17 +178,17 @@ export default function PoseComparisonPanel({ project, onError }: Props) {
           />
         </label>
         <label>
-          <span>Tolerance</span>
+          <span>{t("Tolerance")}</span>
           <select value={styleMode} onChange={(event) => setStyleMode(event.target.value as PoseStyleMode)}>
-            <option value="realistic">Realistic</option>
-            <option value="semi_realistic">Semi-realistic</option>
-            <option value="stylized">Stylized</option>
-            <option value="intentional_distortion">Intentional distortion</option>
+            <option value="realistic">{t("Realistic")}</option>
+            <option value="semi_realistic">{t("Semi-realistic")}</option>
+            <option value="stylized">{t("Stylized")}</option>
+            <option value="intentional_distortion">{t("Intentional distortion")}</option>
           </select>
         </label>
         <button className="primary-action" disabled={!reference || busy !== null} onClick={create}>
           {busy === "upload" ? <LoaderCircle className="spin" size={18} /> : <Upload size={18} />}
-          {reference ? `Use ${reference.name}` : "Choose a reference first"}
+          {reference ? t("Use {filename}", { filename: reference.name }) : t("Choose a reference first")}
         </button>
       </section>
     );
@@ -195,16 +198,16 @@ export default function PoseComparisonPanel({ project, onError }: Props) {
     <section className="pose-panel">
       <header className="pose-panel-header">
         <div>
-          <p className="eyebrow">Reference-based body check</p>
-          <h2>Confirm the evidence before comparing.</h2>
-          <p>{comparison.reference_filename} · {styleMode.replaceAll("_", " ")} tolerance</p>
+          <p className="eyebrow">{t("Reference-based body check")}</p>
+          <h2>{t("Confirm the evidence before comparing.")}</h2>
+          <p>{comparison.reference_filename} · {t("{style} tolerance", { style: t(styleMode.replaceAll("_", " ")) })}</p>
         </div>
-        <span className={`pose-status ${comparison.status}`}>{comparison.status}</span>
+        <span className={`pose-status ${comparison.status}`}>{t(comparison.status)}</span>
       </header>
 
       <div className="pose-editor-grid">
         <article>
-          <div className="pose-editor-title"><strong>Artwork</strong><small>{artworkSkeleton?.model || "Select one person"}</small></div>
+          <div className="pose-editor-title"><strong>{t("Artwork")}</strong><small>{artworkSkeleton?.model || t("Select one person")}</small></div>
           <PoseCanvas
             imageUrl={assetUrl(comparison.artwork_image_url)}
             bbox={artworkBox}
@@ -221,7 +224,7 @@ export default function PoseComparisonPanel({ project, onError }: Props) {
           )}
         </article>
         <article>
-          <div className="pose-editor-title"><strong>Reference</strong><small>{referenceSkeleton?.model || "Select the matching person"}</small></div>
+          <div className="pose-editor-title"><strong>{t("Reference")}</strong><small>{referenceSkeleton?.model || t("Select the matching person")}</small></div>
           <PoseCanvas
             imageUrl={assetUrl(comparison.reference_image_url)}
             bbox={referenceBox}
@@ -241,10 +244,10 @@ export default function PoseComparisonPanel({ project, onError }: Props) {
 
       {!artworkSkeleton || !referenceSkeleton ? (
         <div className="pose-actions">
-          <p>Resize each orange box around exactly one matching figure.</p>
+          <p>{t("Resize each orange box around exactly one matching figure.")}</p>
           <button className="primary-action" disabled={busy !== null} onClick={estimate}>
             {busy === "estimate" ? <LoaderCircle className="spin" size={18} /> : <GitCompareArrows size={18} />}
-            Estimate both skeletons
+            {t("Estimate both skeletons")}
           </button>
         </div>
       ) : (
@@ -253,17 +256,17 @@ export default function PoseComparisonPanel({ project, onError }: Props) {
             {[...artworkSkeleton.warnings, ...referenceSkeleton.warnings]
               .filter((value, index, values) => values.indexOf(value) === index)
               .slice(0, 4)
-              .map((warning) => <span key={warning}><AlertTriangle size={13} />{warning}</span>)}
+              .map((warning) => <span key={warning}><AlertTriangle size={13} />{reportText(warning)}</span>)}
           </div>
           <div className="pose-actions">
-            <p>Drag misplaced joints. Yellow points were corrected by you; comparison uses the saved positions.</p>
+            <p>{t("Drag misplaced joints. Yellow points were corrected by you; comparison uses the saved positions.")}</p>
             <button disabled={busy !== null} onClick={() => save(false)}>
               {busy === "save" ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}
-              Save corrections
+              {t("Save corrections")}
             </button>
             <button className="primary-action" disabled={busy !== null} onClick={compare}>
               {busy === "compare" ? <LoaderCircle className="spin" size={18} /> : <GitCompareArrows size={18} />}
-              Confirm and compare
+              {t("Confirm and compare")}
             </button>
           </div>
         </>
@@ -274,30 +277,30 @@ export default function PoseComparisonPanel({ project, onError }: Props) {
           <div className={`pose-verdict ${comparison.result.overall_status}`}>
             {comparison.result.overall_status === "consistent" ? <Check size={18} /> : <AlertTriangle size={18} />}
             <div>
-              <strong>{comparison.result.overall_status.replace("_", " ")}</strong>
-              <small>{comparison.result.comparable_keypoint_count} comparable keypoints</small>
+              <strong>{t(comparison.result.overall_status)}</strong>
+              <small>{t("{count} comparable keypoints", { count: comparison.result.comparable_keypoint_count })}</small>
             </div>
           </div>
           <div className="pose-finding-grid">
             {comparison.result.findings.map((finding, index) => (
               <article key={`${finding.title}-${index}`} className={finding.status}>
-                <div><span>{finding.category}</span><strong>{Math.round(finding.confidence * 100)}%</strong></div>
-                <h3>{finding.title}</h3>
-                <p>{finding.observation}</p>
-                <p>{finding.reference}</p>
-                <b>{finding.difference}</b>
-                <small>{finding.suggestion}</small>
+                <div><span>{t(finding.category)}</span><strong>{Math.round(finding.confidence * 100)}%</strong></div>
+                <h3>{reportText(finding.title)}</h3>
+                <p>{reportText(finding.observation)}</p>
+                <p>{reportText(finding.reference)}</p>
+                <b>{reportText(finding.difference)}</b>
+                <small>{reportText(finding.suggestion)}</small>
               </article>
             ))}
           </div>
           <details>
-            <summary>Assumptions and limits</summary>
-            {comparison.result.assumptions.map((assumption) => <p key={assumption}>• {assumption}</p>)}
+            <summary>{t("Assumptions and limits")}</summary>
+            {comparison.result.assumptions.map((assumption) => <p key={assumption}>• {reportText(assumption)}</p>)}
           </details>
         </div>
       )}
       <button className="pose-new-reference" onClick={() => setComparison(null)}>
-        <X size={14} /> Start with another reference
+        <X size={14} /> {" "}{t("Start with another reference")}
       </button>
     </section>
   );
@@ -310,6 +313,7 @@ function PointVisibility({
   skeleton: PoseSkeleton;
   onToggle: (name: string) => void;
 }) {
+  const { t } = useLocale();
   const lowCount = skeleton.keypoints.filter(
     (point) => point.source === "model" && point.confidence < 0.3,
   ).length;
@@ -318,7 +322,7 @@ function PointVisibility({
   ).length;
   return (
     <details className="pose-point-list">
-      <summary>Point visibility · {lowCount} low confidence · {hiddenCount} hidden</summary>
+      <summary>{t("Point visibility · {low} low confidence · {hidden} hidden", { low: lowCount, hidden: hiddenCount })}</summary>
       <div>
         {skeleton.keypoints.map((point) => (
           <button
@@ -327,7 +331,7 @@ function PointVisibility({
             onClick={() => onToggle(point.name)}
             type="button"
           >
-            {point.name.replaceAll("_", " ")}
+            {t(point.name.replaceAll("_", " "))}
           </button>
         ))}
       </div>

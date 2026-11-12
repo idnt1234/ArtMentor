@@ -8,7 +8,9 @@ AI 密钥并启用确定性回退，因此不会访问公网或消耗额度。�
 import io
 import json
 import zipfile
+from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image, ImageDraw
 from sqlalchemy import delete
@@ -31,11 +33,30 @@ def artwork_bytes(shift: int = 0) -> bytes:
     return buffer.getvalue()
 
 
-def test_complete_offline_critique_flow() -> None:
+@pytest.mark.parametrize(
+    ("language_header", "restatement_start", "overall_start", "comparison_start"),
+    [
+        ("zh-CN", "你希望", "画面的氛围统一", "修改版尝试让画面的主次更清楚"),
+        ("zh-CN,zh;q=0.9,en;q=0.8", "You want", "The image has", "The revision makes"),
+    ],
+    ids=["explicit-chinese", "browser-language-list"],
+)
+def test_complete_offline_critique_flow(
+    language_header: str,
+    restatement_start: str,
+    overall_start: str,
+    comparison_start: str,
+) -> None:
     """一条测试覆盖从作品进入系统到修改版报告产出的完整主路径。"""
     # 端到端覆盖：样例导入、上传、意图复述、点评、反馈、修改版比较。
     # conftest 会清空真实密钥，因此本测试不会消耗任何 API 额度。
-    with TestClient(app) as client:
+    with TestClient(
+        app,
+        headers={
+            "Accept-Language": language_header,
+            "X-Forwarded-For": "198.51.100.53",
+        },
+    ) as client:
         sample_asset = client.get("/api/sample-assets/wheat-field")
         assert sample_asset.status_code == 200
         assert sample_asset.headers["content-type"] == "image/png"
@@ -61,6 +82,9 @@ def test_complete_offline_critique_flow() -> None:
         assert restated.json()["provider"] == "demo"
         assert restated.json()["action_status"] == "unknown"
         assert restated.json()["stage_assessment"] == "consistent"
+        assert restated.json()["suggested_stage"] == "Sketch"
+        assert restated.json()["restatement"].startswith(restatement_start)
+        assert "Make the warm figure feel hopeful" in restated.json()["restatement"]
 
         analyzed = client.post(
             f"/api/projects/{project['id']}/analyze",
@@ -77,6 +101,16 @@ def test_complete_offline_critique_flow() -> None:
         assert len(analysis["result"]["references"]) == 3
         assert analysis["result"]["confirmed_stage"] == "Gesture sketch"
         assert "reaching" in analysis["result"]["confirmed_action"]
+        assert analysis["result"]["overall_read"].startswith(overall_start)
+        assert analysis["result"]["dimensions"][0]["dimension"] == "composition"
+        if language_header == "zh-CN":
+            assert "演示点评" in analysis["result"]["warning"]
+            assert "观众" in analysis["result"]["suggestions"][0]["title"]
+            assert "视线" in analysis["result"]["references"][0]["rationale"]
+        reloaded = client.get(
+            f"/api/analyses/{analysis['id']}", headers={"Accept-Language": "en"}
+        )
+        assert reloaded.json()["result"] == analysis["result"]
 
         # intentional 反馈不仅是 UI 状态，还要持久化画师给出的设计理由。
         suggestion = analysis["result"]["suggestions"][0]
@@ -97,6 +131,7 @@ def test_complete_offline_critique_flow() -> None:
         )
         assert revision.status_code == 200, revision.text
         assert len(revision.json()["comparison"]["changes"]) == 4
+        assert revision.json()["comparison"]["summary"].startswith(comparison_start)
 
 
 def test_anonymous_sessions_cannot_read_each_others_projects() -> None:
@@ -286,6 +321,24 @@ def test_production_frontend_is_served_when_built() -> None:
             assert "ArtMentor" in response.text
         else:
             assert response.status_code == 404
+
+
+def test_production_showcase_uses_image_content_type(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    (tmp_path / "index.html").write_text("<title>ArtMentor</title>", encoding="utf-8")
+    showcase = tmp_path / "showcase"
+    showcase.mkdir()
+    asset = showcase / "study.webp"
+    Image.new("RGB", (12, 12), "white").save(asset)
+    monkeypatch.setattr(main_module, "frontend_dist", tmp_path)
+
+    with TestClient(app) as client:
+        response = client.get("/showcase/study.webp")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"] == "image/webp"
+    assert response.content == asset.read_bytes()
 
 
 def test_optional_access_code_unlocks_api_and_media_cookie() -> None:
